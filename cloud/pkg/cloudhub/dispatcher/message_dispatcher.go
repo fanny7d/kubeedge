@@ -24,6 +24,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/api/apis/reliablesyncs/v1alpha1"
@@ -214,7 +215,10 @@ func (md *messageDispatcher) PubToController(info *model.HubInfo, msg *beehivemo
 }
 
 func (md *messageDispatcher) enqueueNoAckMessage(nodeID string, msg *beehivemodel.Message) {
-	nodeMessagePool := md.GetNodeMessagePool(nodeID)
+	nodeMessagePool := md.getActiveNodeMessagePool(nodeID)
+	if nodeMessagePool == nil {
+		return
+	}
 
 	messageKey, _ := common.NoAckMessageKeyFunc(msg)
 	if err := nodeMessagePool.NoAckMessageStore.Add(msg); err != nil {
@@ -230,7 +234,10 @@ func (md *messageDispatcher) enqueueAckMessage(nodeID string, msg *beehivemodel.
 		return
 	}
 
-	nodeMessagePool := md.GetNodeMessagePool(nodeID)
+	nodeMessagePool := md.getActiveNodeMessagePool(nodeID)
+	if nodeMessagePool == nil {
+		return
+	}
 	nodeQueue := nodeMessagePool.AckMessageQueue
 	nodeStore := nodeMessagePool.AckMessageStore
 
@@ -298,6 +305,15 @@ func (md *messageDispatcher) enqueueNonNamespacedResource(nodeID string, msg *be
 		if synccontroller.CompareResourceVersion(msg.GetResourceVersion(), clusterObjectSync.Status.ObjectResourceVersion) > 0 {
 			return true
 		}
+	case err == nil:
+		clusterObjectSync, err = md.ensureClusterObjectSyncStatusInitialized(clusterObjectSync.Name)
+		if err != nil {
+			klog.ErrorS(err, "Failed to initialize clusterObjectSync status",
+				"clusterObjectSyncName", clusterObjectSyncName,
+				"resourceName", resourceName)
+			return false
+		}
+		return synccontroller.CompareResourceVersion(msg.GetResourceVersion(), clusterObjectSync.Status.ObjectResourceVersion) > 0
 
 	case err != nil && apierrors.IsNotFound(err):
 		// If clusterObjectSync is not exist, this indicates that the message is coming
@@ -314,10 +330,16 @@ func (md *messageDispatcher) enqueueNonNamespacedResource(nodeID string, msg *be
 			},
 		}
 
-		clusterObjectSync, err := md.reliableClient.
+		clusterObjectSync, err = md.reliableClient.
 			ReliablesyncsV1alpha1().
 			ClusterObjectSyncs().
 			Create(context.Background(), clusterObjectSync, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			clusterObjectSync, err = md.reliableClient.
+				ReliablesyncsV1alpha1().
+				ClusterObjectSyncs().
+				Get(context.Background(), clusterObjectSyncName, metav1.GetOptions{})
+		}
 		if err != nil {
 			klog.ErrorS(err, "Failed to create clusterObjectSync",
 				"clusterObjectSyncName", clusterObjectSyncName,
@@ -325,11 +347,7 @@ func (md *messageDispatcher) enqueueNonNamespacedResource(nodeID string, msg *be
 			return false
 		}
 
-		clusterObjectSync.Status.ObjectResourceVersion = "0"
-		_, err = md.reliableClient.
-			ReliablesyncsV1alpha1().
-			ClusterObjectSyncs().
-			UpdateStatus(context.Background(), clusterObjectSync, metav1.UpdateOptions{})
+		clusterObjectSync, err = md.ensureClusterObjectSyncStatusInitialized(clusterObjectSync.Name)
 		if err != nil {
 			klog.ErrorS(err, "Failed to update clusterObjectSync",
 				"clusterObjectSyncName", clusterObjectSyncName,
@@ -337,7 +355,7 @@ func (md *messageDispatcher) enqueueNonNamespacedResource(nodeID string, msg *be
 			return false
 		}
 
-		return true
+		return synccontroller.CompareResourceVersion(msg.GetResourceVersion(), clusterObjectSync.Status.ObjectResourceVersion) > 0
 
 	case err != nil:
 		klog.Errorf("failed to get clusterObjectSync %s: %v", clusterObjectSyncName, err)
@@ -363,6 +381,16 @@ func (md *messageDispatcher) enqueueNamespacedResource(nodeID string, msg *beehi
 		if synccontroller.CompareResourceVersion(msg.GetResourceVersion(), objectSync.Status.ObjectResourceVersion) > 0 {
 			return true
 		}
+	case err == nil:
+		objectSync, err = md.ensureObjectSyncStatusInitialized(resourceNamespace, objectSync.Name)
+		if err != nil {
+			klog.ErrorS(err, "Failed to initialize objectSync status",
+				"objectSyncName", objectSyncName,
+				"resourceNamespace", resourceNamespace,
+				"resourceName", resourceName)
+			return false
+		}
+		return synccontroller.CompareResourceVersion(msg.GetResourceVersion(), objectSync.Status.ObjectResourceVersion) > 0
 
 	case err != nil && apierrors.IsNotFound(err):
 		// If objectSync is not exist, this indicates that the message is coming
@@ -380,10 +408,16 @@ func (md *messageDispatcher) enqueueNamespacedResource(nodeID string, msg *beehi
 			},
 		}
 
-		objectSyncStatus, err := md.reliableClient.
+		objectSync, err = md.reliableClient.
 			ReliablesyncsV1alpha1().
 			ObjectSyncs(resourceNamespace).
 			Create(context.Background(), objectSync, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			objectSync, err = md.reliableClient.
+				ReliablesyncsV1alpha1().
+				ObjectSyncs(resourceNamespace).
+				Get(context.Background(), objectSyncName, metav1.GetOptions{})
+		}
 		if err != nil {
 			klog.ErrorS(err, "Failed to create objectSync",
 				"objectSyncName", objectSyncName,
@@ -392,11 +426,7 @@ func (md *messageDispatcher) enqueueNamespacedResource(nodeID string, msg *beehi
 			return false
 		}
 
-		objectSyncStatus.Status.ObjectResourceVersion = "0"
-		_, err = md.reliableClient.
-			ReliablesyncsV1alpha1().
-			ObjectSyncs(resourceNamespace).
-			UpdateStatus(context.Background(), objectSyncStatus, metav1.UpdateOptions{})
+		objectSync, err = md.ensureObjectSyncStatusInitialized(resourceNamespace, objectSync.Name)
 		if err != nil {
 			klog.ErrorS(err, "Failed to update objectSync",
 				"objectSyncName", objectSyncName,
@@ -405,13 +435,63 @@ func (md *messageDispatcher) enqueueNamespacedResource(nodeID string, msg *beehi
 			return false
 		}
 
-		return true
+		return synccontroller.CompareResourceVersion(msg.GetResourceVersion(), objectSync.Status.ObjectResourceVersion) > 0
 
 	case err != nil:
 		klog.Errorf("failed to get ObjectSync %s/%s: %v", resourceNamespace, objectSyncName, err)
 	}
 
 	return false
+}
+
+func (md *messageDispatcher) ensureObjectSyncStatusInitialized(namespace, name string) (*v1alpha1.ObjectSync, error) {
+	var objectSync *v1alpha1.ObjectSync
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest, err := md.reliableClient.
+			ReliablesyncsV1alpha1().
+			ObjectSyncs(namespace).
+			Get(context.Background(), name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if latest.Status.ObjectResourceVersion != "" {
+			objectSync = latest
+			return nil
+		}
+		latest = latest.DeepCopy()
+		latest.Status.ObjectResourceVersion = "0"
+		objectSync, err = md.reliableClient.
+			ReliablesyncsV1alpha1().
+			ObjectSyncs(namespace).
+			UpdateStatus(context.Background(), latest, metav1.UpdateOptions{})
+		return err
+	})
+	return objectSync, err
+}
+
+func (md *messageDispatcher) ensureClusterObjectSyncStatusInitialized(name string) (*v1alpha1.ClusterObjectSync, error) {
+	var clusterObjectSync *v1alpha1.ClusterObjectSync
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest, err := md.reliableClient.
+			ReliablesyncsV1alpha1().
+			ClusterObjectSyncs().
+			Get(context.Background(), name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		if latest.Status.ObjectResourceVersion != "" {
+			clusterObjectSync = latest
+			return nil
+		}
+		latest = latest.DeepCopy()
+		latest.Status.ObjectResourceVersion = "0"
+		clusterObjectSync, err = md.reliableClient.
+			ReliablesyncsV1alpha1().
+			ClusterObjectSyncs().
+			UpdateStatus(context.Background(), latest, metav1.UpdateOptions{})
+		return err
+	})
+	return clusterObjectSync, err
 }
 
 func isDeleteMessage(msg *beehivemodel.Message) bool {
@@ -505,13 +585,21 @@ func isVolumeOperation(op string) bool {
 func (md *messageDispatcher) GetNodeMessagePool(nodeID string) *common.NodeMessagePool {
 	nsp, exist := md.NodeMessagePools.Load(nodeID)
 	if !exist {
-		klog.Warningf("message pool for edge node %s not found and created now", nodeID)
-		nodeMessagePool := common.InitNodeMessagePool(nodeID)
-		md.NodeMessagePools.Store(nodeID, nodeMessagePool)
-		return nodeMessagePool
+		klog.V(4).Infof("message pool for edge node %s not found", nodeID)
+		return nil
 	}
 
 	return nsp.(*common.NodeMessagePool)
+}
+
+func (md *messageDispatcher) getActiveNodeMessagePool(nodeID string) *common.NodeMessagePool {
+	if md.SessionManager != nil {
+		if _, exist := md.SessionManager.GetSession(nodeID); !exist {
+			klog.V(4).Infof("skip message for node %s because this CloudHub instance has no active session", nodeID)
+			return nil
+		}
+	}
+	return md.GetNodeMessagePool(nodeID)
 }
 
 func (md *messageDispatcher) AddNodeMessagePool(nodeID string, pool *common.NodeMessagePool) {
