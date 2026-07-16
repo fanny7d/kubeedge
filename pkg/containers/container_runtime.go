@@ -103,7 +103,13 @@ func (runtime *ContainerRuntimeImpl) CopyResources(
 	defer func() {
 		cleanupErr := runtime.cleanupCopyResources(ctx, sandbox, containerID, containerStarted, logDirectory)
 		if cleanupErr != nil {
-			retErr = errors.Join(retErr, cleanupErr)
+			if retErr != nil {
+				retErr = errors.Join(retErr, cleanupErr)
+				return
+			}
+			// The copy completed successfully. A transient CRI cleanup failure must not
+			// make keadm retry the whole join and create another resource-copy sandbox.
+			klog.Warningf("resource copy cleanup did not complete: %v", cleanupErr)
 		}
 	}()
 
