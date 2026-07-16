@@ -143,6 +143,7 @@ func parseMaxSize(size string) (int64, error) {
 type containerLogManager struct {
 	runtimeService   internalapi.RuntimeService
 	osInterface      kubecontainer.OSInterface
+	podLogsDirectory string
 	policy           LogRotatePolicy
 	clock            clock.Clock
 	mutex            sync.Mutex
@@ -152,7 +153,7 @@ type containerLogManager struct {
 }
 
 // NewContainerLogManager creates a new container log manager.
-func NewContainerLogManager(runtimeService internalapi.RuntimeService, osInterface kubecontainer.OSInterface, maxSize string, maxFiles int, maxWorkers int, monitorInterval metav1.Duration) (ContainerLogManager, error) {
+func NewContainerLogManager(runtimeService internalapi.RuntimeService, osInterface kubecontainer.OSInterface, maxSize string, maxFiles int, maxWorkers int, monitorInterval metav1.Duration, podLogsDirectory string) (ContainerLogManager, error) {
 	if maxFiles <= 1 {
 		return nil, fmt.Errorf("invalid MaxFiles %d, must be > 1", maxFiles)
 	}
@@ -166,8 +167,9 @@ func NewContainerLogManager(runtimeService internalapi.RuntimeService, osInterfa
 	}
 	// policy LogRotatePolicy
 	return &containerLogManager{
-		osInterface:    osInterface,
-		runtimeService: runtimeService,
+		osInterface:      osInterface,
+		runtimeService:   runtimeService,
+		podLogsDirectory: filepath.Clean(podLogsDirectory),
 		policy: LogRotatePolicy{
 			MaxSize:  parsedMaxSize,
 			MaxFiles: maxFiles,
@@ -210,19 +212,50 @@ func (c *containerLogManager) Clean(ctx context.Context, containerID string) err
 	if resp.GetStatus() == nil {
 		return fmt.Errorf("container status is nil for %q", containerID)
 	}
-	pattern := fmt.Sprintf("%s*", resp.GetStatus().GetLogPath())
+	logPath, err := c.validateLogPath(resp.GetStatus().GetLogPath())
+	if err != nil {
+		return fmt.Errorf("refusing to clean container %q logs: %w", containerID, err)
+	}
+	pattern := fmt.Sprintf("%s*", logPath)
 	logs, err := c.osInterface.Glob(pattern)
 	if err != nil {
 		return fmt.Errorf("failed to list all log files with pattern %q: %v", pattern, err)
 	}
 
 	for _, l := range logs {
+		if _, err := c.validateLogPath(l); err != nil {
+			return fmt.Errorf("refusing to remove container %q log %q: %w", containerID, l, err)
+		}
 		if err := c.osInterface.Remove(l); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed to remove container %q log %q: %v", containerID, l, err)
 		}
 	}
 
 	return nil
+}
+
+func (c *containerLogManager) validateLogPath(logPath string) (string, error) {
+	if logPath == "" {
+		return "", fmt.Errorf("log path is empty")
+	}
+	if !filepath.IsAbs(logPath) {
+		return "", fmt.Errorf("log path %q is not absolute", logPath)
+	}
+
+	cleanLogPath := filepath.Clean(logPath)
+	podLogsDirectory := filepath.Clean(c.podLogsDirectory)
+	if podLogsDirectory == "." || !filepath.IsAbs(podLogsDirectory) || podLogsDirectory == string(filepath.Separator) {
+		return "", fmt.Errorf("pod logs directory %q is unsafe", c.podLogsDirectory)
+	}
+	relativePath, err := filepath.Rel(podLogsDirectory, cleanLogPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve log path %q against pod logs directory %q: %w", cleanLogPath, podLogsDirectory, err)
+	}
+	if relativePath == "." || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("log path %q is outside pod logs directory %q", cleanLogPath, podLogsDirectory)
+	}
+
+	return cleanLogPath, nil
 }
 
 func (c *containerLogManager) processQueueItems(ctx context.Context, worker int) {
