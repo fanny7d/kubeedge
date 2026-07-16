@@ -119,17 +119,17 @@ func TestCopyResources(t *testing.T) {
 			},
 		},
 		{
-			name:    "Failure: cleanup error is returned",
+			name:    "Success: cleanup error after copy is nonfatal",
 			image:   "kubeedge/pause:3.1",
 			files:   map[string]string{"/src": "/dest"},
-			wantErr: true,
+			wantErr: false,
 			setupMock: func(t *testing.T, m *mock.MockRuntimeService) {
 				m.EXPECT().RunPodSandbox(gomock.Any(), gomock.Any(), gomock.Any()).Return("sb-cleanup", nil)
 				m.EXPECT().CreateContainer(gomock.Any(), "sb-cleanup", gomock.Any(), gomock.Any()).Return("cnt-cleanup", nil)
 				m.EXPECT().StartContainer(gomock.Any(), "cnt-cleanup").Return(nil)
 				m.EXPECT().ExecSync(gomock.Any(), "cnt-cleanup", gomock.Any(), gomock.Any()).Return(nil, nil, nil)
-				m.EXPECT().StopContainer(gomock.Any(), "cnt-cleanup", copyResourcesStopTimeout).Return(nil)
-				m.EXPECT().RemoveContainer(gomock.Any(), "cnt-cleanup").Return(fmt.Errorf("remove timeout"))
+				m.EXPECT().StopContainer(gomock.Any(), "cnt-cleanup", copyResourcesStopTimeout).Return(fmt.Errorf("stream terminated by RST_STREAM"))
+				m.EXPECT().RemoveContainer(gomock.Any(), "cnt-cleanup").Return(nil)
 				m.EXPECT().RemovePodSandbox(gomock.Any(), "sb-cleanup").Return(nil)
 			},
 		},
