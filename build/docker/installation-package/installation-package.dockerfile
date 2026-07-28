@@ -1,9 +1,7 @@
-FROM kubeedge/build-tools:1.23.12-ke1 as builder
+FROM kubeedge/build-tools:1.23.12-ke1 AS builder
 WORKDIR /work
 ADD . .
-RUN mkdir -p bin && \
-    make WHAT=edgecore BUILD_WITH_CONTAINER=false && cp _output/local/bin/edgecore bin/edgecore && \
-    make WHAT=keadm BUILD_WITH_CONTAINER=false && cp _output/local/bin/keadm bin/keadm
+RUN make WHAT="edgecore keadm" BUILD_WITH_CONTAINER=false
 
 FROM ubuntu:18.04
 COPY --from=builder /work/_output/local/bin/edgecore /usr/local/bin/edgecore
