@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -35,6 +36,8 @@ type serviceAccountToken struct {
 }
 
 const maxTTL = 24 * time.Hour
+
+var errServiceAccountTokenCacheMiss = errors.New("service account token not found in local cache")
 
 func newServiceAccountToken(s SendInterface) *serviceAccountToken {
 	return &serviceAccountToken{
@@ -118,6 +121,20 @@ func normalizeAudiences(audiences []string) []string {
 	return []string{constants.DefaultServiceAccountIssuer}
 }
 
+func validateServiceAccountTokenMetaCount(resKey string, count int) error {
+	switch count {
+	case 0:
+		// A cache miss is expected before the token is fetched from CloudCore.
+		klog.V(4).Infof("service account token %s not found in local cache", resKey)
+		return fmt.Errorf("%w: %s", errServiceAccountTokenCacheMiss, resKey)
+	case 1:
+		return nil
+	default:
+		klog.Errorf("query meta %s returned %d entries", resKey, count)
+		return fmt.Errorf("query meta %s returned %d entries", resKey, count)
+	}
+}
+
 func getTokenLocally(name, namespace string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 	resKey := KeyFunc(name, namespace, tr)
 	ms := dbclient.NewMetaService()
@@ -126,9 +143,8 @@ func getTokenLocally(name, namespace string, tr *authenticationv1.TokenRequest) 
 		klog.Errorf("query meta %s failed: %v", resKey, err)
 		return nil, err
 	}
-	if len(*metas) != 1 {
-		klog.Errorf("query meta %s length error", resKey)
-		return nil, fmt.Errorf("query meta %s length error", resKey)
+	if err := validateServiceAccountTokenMetaCount(resKey, len(*metas)); err != nil {
+		return nil, err
 	}
 	var tokenRequest authenticationv1.TokenRequest
 	err = json.Unmarshal([]byte((*metas)[0]), &tokenRequest)

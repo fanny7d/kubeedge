@@ -17,6 +17,7 @@ limitations under the License.
 package client
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -28,6 +29,25 @@ import (
 	"github.com/kubeedge/api/apis/common/constants"
 	metaserverconfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/config"
 )
+
+func TestValidateServiceAccountTokenMetaCount(t *testing.T) {
+	t.Run("cache miss", func(t *testing.T) {
+		err := validateServiceAccountTokenMetaCount("test-key", 0)
+		require.Error(t, err)
+		assert.True(t, errors.Is(err, errServiceAccountTokenCacheMiss))
+	})
+
+	t.Run("single cached token", func(t *testing.T) {
+		assert.NoError(t, validateServiceAccountTokenMetaCount("test-key", 1))
+	})
+
+	t.Run("database invariant violation", func(t *testing.T) {
+		err := validateServiceAccountTokenMetaCount("test-key", 2)
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, errServiceAccountTokenCacheMiss))
+		assert.ErrorContains(t, err, "returned 2 entries")
+	})
+}
 
 func TestKeyFuncNormalizesDefaultAudiences(t *testing.T) {
 	originalIssuers := append([]string(nil), metaserverconfig.Config.ServiceAccountIssuers...)
