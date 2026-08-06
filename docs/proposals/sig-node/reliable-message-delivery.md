@@ -9,7 +9,7 @@ approvers:
   - "@sids-b"
   - "@kadisi"
 creation-date: 2019-12-23
-last-updated: 2019-12-23
+last-updated: 2026-07-28
 status: Implemented
 ---
 
@@ -103,6 +103,24 @@ When cloudhub add events to nodeMessageQueue, it will be compared with the corre
 If the object in nodeMessageQueue is newer, it will directly discard these events.
 
 <img src="../../images/reliable-message-delivery/sync-controller.PNG">
+
+### CloudCore HA and session ownership
+
+In a multi-replica CloudCore deployment, the controller that produces a resource event and the CloudHub
+replica that owns the target edge-node session can be different processes. The node message queue is local
+to the session-owning replica, while `ObjectSync` and `ClusterObjectSync` are shared through Kubernetes.
+
+When the receiving CloudHub replica has no local session for the target node, MessageDispatcher must still
+persist the shared sync object for non-delete, non-response resource events. It must not create a local node
+message pool. SyncController on the replica with the active session then observes the shared sync object and
+delivers the resource. The edge ACK advances `status.objectResourceVersion` as in the single-replica path.
+
+The expected invariants are:
+
+- no active local session means no local node message pool is created;
+- the shared sync object records the resource API version, kind, name, and target node;
+- a new sync object starts with `status.objectResourceVersion` set to `0`;
+- after the edge persists and ACKs the object, the sync status matches the source object's resource version.
 
 ### Message Queue
 

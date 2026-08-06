@@ -448,11 +448,22 @@ func TestEnqueueAckMessageInitializesExistingClusterObjectSyncAfterCreateRace(t 
 	}
 }
 
-func TestEnqueueAckMessageSkipsWhenNodeHasNoLocalSession(t *testing.T) {
+func TestEnqueueAckMessagePersistsServiceAccountAccessWithoutLocalSession(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	manager := session.NewSessionManager(10)
 
-	msg := tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "3"), "update")
+	serviceAccountAccess := &policyv1alpha1.ServiceAccountAccess{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "orangepi-agent",
+			Namespace:       tf.TestNamespace,
+			UID:             types.UID("saa-uid"),
+			ResourceVersion: "3",
+		},
+	}
+	msg := beehivemodel.NewMessage("").
+		SetResourceVersion(serviceAccountAccess.ResourceVersion).
+		FillBody(serviceAccountAccess).
+		BuildRouter("policycontroller", "resource", "node/"+tf.TestNodeID+"/"+tf.TestNamespace+"/serviceaccountaccess/orangepi-agent", "update")
 	objectSyncLister := synclisters.NewObjectSyncLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{}))
 	clusterObjectSyncLister := synclisters.NewClusterObjectSyncLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{}))
 	dispatcher := &messageDispatcher{
@@ -466,6 +477,20 @@ func TestEnqueueAckMessageSkipsWhenNodeHasNoLocalSession(t *testing.T) {
 
 	if _, exists := dispatcher.NodeMessagePools.Load(tf.TestNodeID); exists {
 		t.Fatalf("expected dispatcher not to create a local message pool without a node session")
+	}
+	objectSyncName := synccontroller.BuildObjectSyncName(tf.TestNodeID, string(serviceAccountAccess.UID))
+	got, err := client.ReliablesyncsV1alpha1().ObjectSyncs(tf.TestNamespace).Get(
+		t.Context(), objectSyncName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected shared objectSync to be persisted without a local node session: %v", err)
+	}
+	if got.Spec.ObjectAPIVersion != "policy.kubeedge.io/v1alpha1" ||
+		got.Spec.ObjectKind != "ServiceAccountAccess" ||
+		got.Spec.ObjectName != serviceAccountAccess.Name {
+		t.Fatalf("unexpected objectSync spec: %#v", got.Spec)
+	}
+	if got.Status.ObjectResourceVersion != "0" {
+		t.Fatalf("expected new objectSync status to be initialized to 0, got %q", got.Status.ObjectResourceVersion)
 	}
 }
 
