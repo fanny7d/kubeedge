@@ -182,6 +182,18 @@ func TestLeases_Get(t *testing.T) {
 			expectedLease: nil,
 			expectErr:     true,
 		},
+		{
+			name: "Local database response while disconnected",
+			respFunc: func(message *model.Message) (*model.Message, error) {
+				resp := model.NewMessage(message.GetID()).
+					SetRoute(modules.MetaManagerModuleName, modules.MetaGroup).
+					SetResourceOperation(message.GetResource(), model.ResponseOperation).
+					FillBody([]string{`{"metadata":{"name":"test-lease"}}`})
+				return resp, nil
+			},
+			expectedLease: nil,
+			expectErr:     true,
+		},
 	}
 
 	for _, test := range testCases {
@@ -208,6 +220,58 @@ func TestLeases_Get(t *testing.T) {
 				assert.NoError(err)
 				assert.Equal(test.expectedLease, lease)
 			}
+		})
+	}
+}
+
+func TestLeases_ResponseError(t *testing.T) {
+	leaseName := "test-lease"
+	inputLease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: leaseName},
+	}
+	const remoteError = "failed to process remote: not connected"
+
+	testCases := []struct {
+		name      string
+		operation string
+		call      func(*leases) (*coordinationv1.Lease, error)
+	}{
+		{
+			name:      "Create",
+			operation: model.InsertOperation,
+			call: func(client *leases) (*coordinationv1.Lease, error) {
+				return client.Create(inputLease)
+			},
+		},
+		{
+			name:      "Update",
+			operation: model.UpdateOperation,
+			call: func(client *leases) (*coordinationv1.Lease, error) {
+				return client.Update(inputLease)
+			},
+		},
+		{
+			name:      "Get",
+			operation: model.QueryOperation,
+			call: func(client *leases) (*coordinationv1.Lease, error) {
+				return client.Get(leaseName)
+			},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			mockSend := &mockSendInterface{
+				sendSyncFunc: func(request *model.Message) (*model.Message, error) {
+					assert.Equal(t, test.operation, request.GetOperation())
+					return model.NewErrorMessage(request, remoteError), nil
+				},
+			}
+
+			lease, err := test.call(newLeases(testNamespace, mockSend))
+
+			assert.Nil(t, lease)
+			assert.EqualError(t, err, "lease request failed: "+remoteError)
 		})
 	}
 }
@@ -251,11 +315,24 @@ func TestHandleLeaseResp(t *testing.T) {
 	assert.Nil(lease)
 	assert.Equal("Test error", err.Error())
 
-	// Test case 3: Invalid JSON
-	invalidContent := []byte("invalid json")
+	// Test case 3: Invalid LeaseResp JSON
+	invalidContent := []byte(`{"Object":`)
 
 	lease, err = handleLeaseResp(invalidContent)
 	assert.Error(err)
 	assert.Nil(lease)
 	assert.Contains(err.Error(), "unmarshal message to lease failed")
+
+	// Test case 4: Bare remote error
+	lease, err = handleLeaseResp([]byte("failed to process remote: not connected"))
+	assert.Nil(lease)
+	assert.EqualError(err, "lease request failed: failed to process remote: not connected")
+
+	// Test case 5: Local MetaManager database response while disconnected
+	localDBContent, marshalErr := json.Marshal([]string{`{"metadata":{"name":"test-lease"}}`})
+	assert.NoError(marshalErr)
+
+	lease, err = handleLeaseResp(localDBContent)
+	assert.Nil(lease)
+	assert.EqualError(err, "lease response unavailable: MetaManager returned 1 local database entries instead of LeaseResp (edge may be offline)")
 }
