@@ -494,6 +494,42 @@ func TestEnqueueAckMessagePersistsServiceAccountAccessWithoutLocalSession(t *tes
 	}
 }
 
+func TestEnqueueAckMessagePersistsClusterObjectSyncWithoutLocalSession(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	manager := session.NewSessionManager(10)
+
+	node := tf.NewTestNodeResource(tf.TestNodeID, tf.TestNodeUID, "3")
+	msg := tf.NewNodeMessage(node, "update")
+	objectSyncLister := synclisters.NewObjectSyncLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{}))
+	clusterObjectSyncLister := synclisters.NewClusterObjectSyncLister(cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{}))
+	dispatcher := &messageDispatcher{
+		reliableClient:          client,
+		SessionManager:          manager,
+		objectSyncLister:        objectSyncLister,
+		clusterObjectSyncLister: clusterObjectSyncLister,
+	}
+
+	dispatcher.enqueueAckMessage(tf.TestNodeID, msg)
+
+	if _, exists := dispatcher.NodeMessagePools.Load(tf.TestNodeID); exists {
+		t.Fatalf("expected dispatcher not to create a local message pool without a node session")
+	}
+	clusterObjectSyncName := synccontroller.BuildObjectSyncName(tf.TestNodeID, string(node.UID))
+	got, err := client.ReliablesyncsV1alpha1().ClusterObjectSyncs().Get(
+		t.Context(), clusterObjectSyncName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("expected shared clusterObjectSync to be persisted without a local node session: %v", err)
+	}
+	if got.Spec.ObjectAPIVersion != "v1" ||
+		got.Spec.ObjectKind != "Node" ||
+		got.Spec.ObjectName != node.Name {
+		t.Fatalf("unexpected clusterObjectSync spec: %#v", got.Spec)
+	}
+	if got.Status.ObjectResourceVersion != "0" {
+		t.Fatalf("expected new clusterObjectSync status to be initialized to 0, got %q", got.Status.ObjectResourceVersion)
+	}
+}
+
 func TestEnqueueNamespacedResourceSkipsAPIForInitializedObjectSync(t *testing.T) {
 	msg, objectSync := newNamespacedObjectSyncSpecTestData(t, true)
 	client, dispatcher := newObjectSyncSpecTestDispatcher(t, objectSync, nil)
