@@ -10,11 +10,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 
+	"github.com/kubeedge/api/apis/common/constants"
 	policyv1alpha1 "github.com/kubeedge/api/apis/policy/v1alpha1"
 	"github.com/kubeedge/beehive/pkg/core/model"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/message"
 	"github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/dao/dbclient"
+	metaserverconfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/config"
 )
 
 // ServiceAccountTokenGetter is interface to get client service account token
@@ -99,7 +101,21 @@ func KeyFunc(name, namespace string, tr *authenticationv1.TokenRequest) string {
 		ref = *tr.Spec.BoundObjectRef
 	}
 
-	return fmt.Sprintf("%q/%q/%#v/%#v/%#v", name, namespace, tr.Spec.Audiences, exp, ref)
+	return fmt.Sprintf("%q/%q/%#v/%#v/%#v", name, namespace, normalizeAudiences(tr.Spec.Audiences), exp, ref)
+}
+
+func normalizeAudiences(audiences []string) []string {
+	if len(audiences) != 0 {
+		return audiences
+	}
+	// Kubernetes defaults omitted TokenRequest audiences to the API server's configured audiences.
+	if len(metaserverconfig.Config.APIAudiences) != 0 {
+		return metaserverconfig.Config.APIAudiences
+	}
+	if len(metaserverconfig.Config.ServiceAccountIssuers) != 0 {
+		return metaserverconfig.Config.ServiceAccountIssuers
+	}
+	return []string{constants.DefaultServiceAccountIssuer}
 }
 
 func getTokenLocally(name, namespace string, tr *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
