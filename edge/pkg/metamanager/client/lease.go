@@ -17,6 +17,7 @@ limitations under the License.
 package client
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -66,12 +67,7 @@ func (c *leases) Create(lease *coordinationv1.Lease) (*coordinationv1.Lease, err
 	if err != nil {
 		return nil, fmt.Errorf("create lease failed, err: %v", err)
 	}
-
-	content, err := resp.GetContentData()
-	if err != nil {
-		return nil, fmt.Errorf("parse message to lease failed, err: %v", err)
-	}
-	return handleLeaseResp(content)
+	return handleLeaseMessage(resp)
 }
 
 func (c *leases) Update(lease *coordinationv1.Lease) (*coordinationv1.Lease, error) {
@@ -81,12 +77,7 @@ func (c *leases) Update(lease *coordinationv1.Lease) (*coordinationv1.Lease, err
 	if err != nil {
 		return nil, fmt.Errorf("update lease failed, err: %v", err)
 	}
-
-	content, err := resp.GetContentData()
-	if err != nil {
-		return nil, fmt.Errorf("parse message to lease failed, err: %v", err)
-	}
-	return handleLeaseResp(content)
+	return handleLeaseMessage(resp)
 }
 
 func (c *leases) Get(name string) (*coordinationv1.Lease, error) {
@@ -96,15 +87,37 @@ func (c *leases) Get(name string) (*coordinationv1.Lease, error) {
 	if err != nil {
 		return nil, fmt.Errorf("query lease failed, err: %v", err)
 	}
+	return handleLeaseMessage(resp)
+}
 
+func handleLeaseMessage(resp *model.Message) (*coordinationv1.Lease, error) {
 	content, err := resp.GetContentData()
 	if err != nil {
 		return nil, fmt.Errorf("parse message to lease failed, err: %v", err)
+	}
+	if resp.GetOperation() == model.ResponseErrorOperation {
+		return nil, leaseResponseError(content)
 	}
 	return handleLeaseResp(content)
 }
 
 func handleLeaseResp(content []byte) (*coordinationv1.Lease, error) {
+	content = bytes.TrimSpace(content)
+	if len(content) == 0 {
+		return nil, fmt.Errorf("lease response is empty")
+	}
+
+	if content[0] == '[' {
+		var entries []string
+		if err := json.Unmarshal(content, &entries); err == nil {
+			return nil, fmt.Errorf("lease response unavailable: MetaManager returned %d local database entries instead of LeaseResp (edge may be offline)", len(entries))
+		}
+		return nil, fmt.Errorf("unexpected lease response format: expected LeaseResp object, got JSON array")
+	}
+	if content[0] != '{' {
+		return nil, leaseResponseError(content)
+	}
+
 	var leaseResp LeaseResp
 	err := json.Unmarshal(content, &leaseResp)
 	if err != nil {
@@ -115,4 +128,17 @@ func handleLeaseResp(content []byte) (*coordinationv1.Lease, error) {
 		return leaseResp.Object, nil
 	}
 	return leaseResp.Object, &leaseResp.Err
+}
+
+func leaseResponseError(content []byte) error {
+	content = bytes.TrimSpace(content)
+	if len(content) == 0 {
+		return fmt.Errorf("lease request failed: empty error response")
+	}
+
+	var message string
+	if content[0] == '"' && json.Unmarshal(content, &message) == nil {
+		return fmt.Errorf("lease request failed: %s", message)
+	}
+	return fmt.Errorf("lease request failed: %s", content)
 }
