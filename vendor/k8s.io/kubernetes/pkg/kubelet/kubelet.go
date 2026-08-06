@@ -601,6 +601,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
 		int(kubeCfg.ContainerLogMaxFiles),
 		int(kubeCfg.ContainerLogMaxWorkers),
 		kubeCfg.ContainerLogMonitorInterval,
+		kubeCfg.PodLogsDir,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize container log manager: %v", err)
