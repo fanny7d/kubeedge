@@ -107,8 +107,21 @@ func (c *PodConfig) Channel(ctx context.Context, source string) chan<- interface
 // config, and also this config has received a SET message from each source.
 func (c *PodConfig) SeenAllSources(seenSources sets.Set[string]) bool {
 	c.podReadyLock.RLock()
-	defer c.podReadyLock.RUnlock()
-	return c.initPodReady
+	initPodReady := c.initPodReady
+	c.podReadyLock.RUnlock()
+	if !initPodReady {
+		return false
+	}
+
+	// Edged marks the initial pod list ready after enqueueing its SET update.
+	// Keep housekeeping blocked until kubelet has consumed that update and
+	// recorded every configured source, otherwise running pods can be mistaken
+	// for orphans during a slow EdgeCore startup.
+	c.sourcesLock.Lock()
+	sources := c.sources.UnsortedList()
+	c.sourcesLock.Unlock()
+
+	return seenSources.HasAll(sources...)
 }
 
 // SetInitPodReady is used to safely set initPodReady flag
