@@ -38,6 +38,7 @@ import (
 	"github.com/kubeedge/api/apis/componentconfig/edgecore/v1alpha2"
 	"github.com/kubeedge/kubeedge/common/constants"
 	"github.com/kubeedge/kubeedge/pkg/image"
+	"github.com/kubeedge/kubeedge/pkg/resourcecopyguard"
 )
 
 const (
@@ -59,6 +60,7 @@ type ContainerRuntime interface {
 type ContainerRuntimeImpl struct {
 	cgroupDriver     string
 	podLogsDirectory string
+	copyStateRoot    string
 	ctrsvc           internalapi.RuntimeService
 
 	*image.RuntimeImpl
@@ -95,27 +97,32 @@ func (runtime *ContainerRuntimeImpl) CopyResources(
 		podLogsDirectory = defaultPodLogsDirectory
 	}
 	sandboxUID := uuid.New().String()
+	copyStateRoot := runtime.copyStateRoot
+	if copyStateRoot == "" {
+		copyStateRoot = resourcecopyguard.DefaultStateRoot()
+	}
+	copyStateDirectory, err := resourcecopyguard.Create(copyStateRoot, sandboxUID)
+	if err != nil {
+		return err
+	}
 	logDirectory := filepath.Join(
 		podLogsDirectory,
 		fmt.Sprintf("%s_%s_%s", constants.SystemNamespace, apiconsts.KubeEdgeBinaryName, sandboxUID),
 	)
 	if err := os.MkdirAll(filepath.Join(logDirectory, copyResourcesContainerName), 0755); err != nil {
+		if removeErr := os.RemoveAll(copyStateDirectory); removeErr != nil {
+			return errors.Join(err, fmt.Errorf("remove resource copy state directory %q: %w",
+				copyStateDirectory, removeErr))
+		}
 		return fmt.Errorf("create resource copy log directory: %w", err)
 	}
-	copyCmd, tempFiles, err := copyResourcesCmd(files, sandboxUID)
-	if err != nil {
-		if removeErr := os.RemoveAll(logDirectory); removeErr != nil {
-			return errors.Join(err, fmt.Errorf("remove resource copy log directory %q: %w", logDirectory, removeErr))
-		}
-		return err
-	}
-	completeFile := filepath.Join(logDirectory, copyResourcesCompleteFile)
 
 	var sandbox, containerID string
 	containerStarted := false
+	var tempFiles []string
 	defer func() {
 		cleanupErr := runtime.cleanupCopyResources(
-			ctx, sandbox, containerID, containerStarted, logDirectory, tempFiles,
+			ctx, sandbox, containerID, containerStarted, logDirectory, copyStateDirectory, tempFiles,
 		)
 		if cleanupErr != nil {
 			if retErr != nil {
@@ -127,6 +134,11 @@ func (runtime *ContainerRuntimeImpl) CopyResources(
 			klog.Warningf("resource copy cleanup did not complete: %v", cleanupErr)
 		}
 	}()
+	copyCmd, tempFiles, err := copyResourcesCmd(files, sandboxUID)
+	if err != nil {
+		return err
+	}
+	completeFile := filepath.Join(copyStateDirectory, copyResourcesCompleteFile)
 
 	psc := &runtimeapi.PodSandboxConfig{
 		Metadata: &runtimeapi.PodSandboxMetadata{
@@ -161,7 +173,7 @@ func (runtime *ContainerRuntimeImpl) CopyResources(
 		})
 	}
 	mounts = append(mounts, &runtimeapi.Mount{
-		HostPath:      logDirectory,
+		HostPath:      copyStateDirectory,
 		ContainerPath: copyResourcesStateMount,
 	})
 	containerConfig := &runtimeapi.ContainerConfig{
@@ -219,7 +231,7 @@ func (runtime *ContainerRuntimeImpl) cleanupCopyResources(
 	ctx context.Context,
 	sandboxID, containerID string,
 	containerStarted bool,
-	logDirectory string,
+	logDirectory, copyStateDirectory string,
 	tempFiles []string,
 ) error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), copyResourcesCleanupTimeout)
@@ -248,6 +260,10 @@ func (runtime *ContainerRuntimeImpl) cleanupCopyResources(
 	}
 	if err := os.RemoveAll(logDirectory); err != nil {
 		cleanupErrors = append(cleanupErrors, fmt.Errorf("remove resource copy log directory %q: %w", logDirectory, err))
+	}
+	if err := os.RemoveAll(copyStateDirectory); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("remove resource copy state directory %q: %w",
+			copyStateDirectory, err))
 	}
 
 	return errors.Join(cleanupErrors...)

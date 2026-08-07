@@ -73,8 +73,11 @@ func TestCopyResources(t *testing.T) {
 						}
 						var foundStateMount bool
 						for _, mount := range config.Mounts {
-							if mount.HostPath == logDirectory && mount.ContainerPath == copyResourcesStateMount {
+							if mount.ContainerPath == copyResourcesStateMount {
 								foundStateMount = true
+								if mount.HostPath == logDirectory {
+									t.Errorf("copy completion state must not share the pod log directory")
+								}
 							}
 						}
 						if !foundStateMount {
@@ -139,16 +142,22 @@ func TestCopyResources(t *testing.T) {
 			files:   map[string]string{"/src": "/dest"},
 			wantErr: false,
 			setupMock: func(t *testing.T, m *mock.MockRuntimeService) {
-				var logDirectory string
-				m.EXPECT().RunPodSandbox(gomock.Any(), gomock.Any(), gomock.Any()).
-					Do(func(_ context.Context, config *runtimeapi.PodSandboxConfig, _ string) {
-						logDirectory = config.LogDirectory
-					}).Return("sb-orphan", nil)
-				m.EXPECT().CreateContainer(gomock.Any(), "sb-orphan", gomock.Any(), gomock.Any()).Return("cnt-orphan", nil)
+				var stateDirectory string
+				m.EXPECT().RunPodSandbox(gomock.Any(), gomock.Any(), gomock.Any()).Return("sb-orphan", nil)
+				m.EXPECT().CreateContainer(gomock.Any(), "sb-orphan", gomock.Any(), gomock.Any()).
+					Do(func(_ context.Context, _ string, config *runtimeapi.ContainerConfig,
+						_ *runtimeapi.PodSandboxConfig,
+					) {
+						for _, mount := range config.Mounts {
+							if mount.ContainerPath == copyResourcesStateMount {
+								stateDirectory = mount.HostPath
+							}
+						}
+					}).Return("cnt-orphan", nil)
 				m.EXPECT().StartContainer(gomock.Any(), "cnt-orphan").Return(nil)
 				m.EXPECT().ExecSync(gomock.Any(), "cnt-orphan", gomock.Any(), gomock.Any()).
 					Do(func(_ context.Context, _ string, _ []string, _ time.Duration) {
-						if err := os.WriteFile(filepath.Join(logDirectory, copyResourcesCompleteFile), nil, 0600); err != nil {
+						if err := os.WriteFile(filepath.Join(stateDirectory, copyResourcesCompleteFile), nil, 0600); err != nil {
 							t.Fatalf("write completion marker: %v", err)
 						}
 					}).Return(nil, nil, fmt.Errorf("process exited with 137"))
@@ -195,9 +204,11 @@ func TestCopyResources(t *testing.T) {
 			ctrl := gomock.NewController(t)
 			mockSvc := mock.NewMockRuntimeService(ctrl)
 			podLogsDirectory := t.TempDir()
+			copyStateRoot := t.TempDir()
 			runtime := &ContainerRuntimeImpl{
 				cgroupDriver:     tt.cgroupDriver,
 				podLogsDirectory: podLogsDirectory,
+				copyStateRoot:    copyStateRoot,
 				ctrsvc:           mockSvc,
 			}
 
@@ -213,6 +224,13 @@ func TestCopyResources(t *testing.T) {
 			if len(entries) != 0 {
 				t.Errorf("resource copy log directory was not cleaned: %v", entries)
 			}
+			stateEntries, readErr := os.ReadDir(copyStateRoot)
+			if readErr != nil {
+				t.Fatalf("read resource-copy state root: %v", readErr)
+			}
+			if len(stateEntries) != 0 {
+				t.Errorf("resource-copy state directory was not cleaned: %v", stateEntries)
+			}
 		})
 	}
 }
@@ -222,6 +240,7 @@ func TestCopyResourcesCleanupUsesIndependentContext(t *testing.T) {
 	mockSvc := mock.NewMockRuntimeService(ctrl)
 	runtime := &ContainerRuntimeImpl{
 		podLogsDirectory: t.TempDir(),
+		copyStateRoot:    t.TempDir(),
 		ctrsvc:           mockSvc,
 	}
 

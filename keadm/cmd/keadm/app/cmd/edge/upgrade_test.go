@@ -268,46 +268,110 @@ func TestUpgradeExecutorPreRun(t *testing.T) {
 
 func TestUpgradeExecutorUpgrade(t *testing.T) {
 	const (
-		edgecoreBin = "/etc/kubeedge/v1.0.0/edgecore"
+		image       = "registry.example/installation-package:v1.0.0"
+		edgecoreBin = "/etc/kubeedge/upgrade/v1.0.0/edgecore"
 	)
-
-	var fileChecked bool
-
+	var events *[]string
+	var copyErr error
+	var replaceErr error
+	var startFailures int
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
-	patches.ApplyFunc(getEdgeCoreBinary, func(_ctx context.Context, _opts UpgradeOptions, _config *cfgv1alpha2.EdgeCoreConfig,
-	) (string, error) {
-		return edgecoreBin, nil
-	})
-	patches.ApplyFunc(os.RemoveAll, func(_path string) error {
+	patches.ApplyFunc(prepareEdgeCoreImage,
+		func(_ context.Context, _ UpgradeOptions, _ *cfgv1alpha2.EdgeCoreConfig,
+		) (string, containers.ContainerRuntime, error) {
+			*events = append(*events, "prepare")
+			return image, &containers.ContainerRuntimeImpl{}, nil
+		})
+	patches.ApplyFunc(copyEdgeCoreBinary,
+		func(_ context.Context, _ UpgradeOptions, gotImage string, _ containers.ContainerRuntime,
+		) (string, error) {
+			assert.Equal(t, image, gotImage)
+			*events = append(*events, "copy")
+			if copyErr != nil {
+				return "", copyErr
+			}
+			return edgecoreBin, nil
+		})
+	patches.ApplyFunc(os.MkdirAll, func(_ string, _ os.FileMode) error { return nil })
+	patches.ApplyFunc(os.RemoveAll, func(_ string) error { return nil })
+	patches.ApplyFunc(util.KillKubeEdgeBinary, func(_ string) error {
+		*events = append(*events, "stop")
 		return nil
 	})
-	patches.ApplyFunc(util.KillKubeEdgeBinary, func(_proc string) error {
-		return nil
-	})
-	patches.ApplyFunc(files.FileCopy, func(src, dst string) error {
-		assert.Equal(t, edgecoreBin, src)
-		assert.Equal(t, "/usr/local/bin/edgecore", dst)
-		fileChecked = true
+	patches.ApplyFunc(files.AtomicFileCopy, func(src, dst string) error {
+		switch src {
+		case "/usr/local/bin/edgecore":
+			assert.Equal(t, "/etc/kubeedge/upgrade/v1.0.0/previous-edgecore", dst)
+			*events = append(*events, "backup")
+		case edgecoreBin:
+			assert.Equal(t, "/usr/local/bin/edgecore", dst)
+			*events = append(*events, "replace")
+			if replaceErr != nil {
+				return replaceErr
+			}
+		case "/etc/kubeedge/upgrade/v1.0.0/previous-edgecore":
+			assert.Equal(t, "/usr/local/bin/edgecore", dst)
+			*events = append(*events, "restore")
+		default:
+			t.Fatalf("unexpected atomic copy %s -> %s", src, dst)
+		}
 		return nil
 	})
 	patches.ApplyFunc(runEdgeCore, func() error {
+		*events = append(*events, "start")
+		if startFailures > 0 {
+			startFailures--
+			return fmt.Errorf("start failed")
+		}
 		return nil
 	})
 
+	successEvents := []string{}
+	events = &successEvents
+	copyErr = nil
+	replaceErr = nil
+	startFailures = 0
 	executor := newUpgradeExecutor()
-	opts := UpgradeOptions{
-		BaseOptions: BaseOptions{
-			Config: constants.EdgecoreConfigPath,
-		},
-	}
-	err := executor.upgrade(context.TODO(), opts)
+	err := executor.upgrade(context.TODO(), UpgradeOptions{ToVersion: "v1.0.0"})
 	assert.NoError(t, err)
-	assert.True(t, fileChecked)
+	assert.Equal(t, []string{"prepare", "backup", "stop", "copy", "replace", "start"}, successEvents)
+
+	failureEvents := []string{}
+	events = &failureEvents
+	copyErr = fmt.Errorf("copy interrupted")
+	executor = newUpgradeExecutor()
+	err = executor.upgrade(context.TODO(), UpgradeOptions{ToVersion: "v1.0.0"})
+	assert.ErrorContains(t, err, "copy interrupted")
+	assert.Equal(t, []string{"prepare", "backup", "stop", "copy", "start"}, failureEvents)
+
+	replaceFailureEvents := []string{}
+	events = &replaceFailureEvents
+	copyErr = nil
+	replaceErr = fmt.Errorf("replace durability failed")
+	startFailures = 0
+	executor = newUpgradeExecutor()
+	err = executor.upgrade(context.TODO(), UpgradeOptions{ToVersion: "v1.0.0"})
+	assert.ErrorContains(t, err, "replace durability failed")
+	assert.Equal(t,
+		[]string{"prepare", "backup", "stop", "copy", "replace", "restore", "start"},
+		replaceFailureEvents)
+
+	startFailureEvents := []string{}
+	events = &startFailureEvents
+	copyErr = nil
+	replaceErr = nil
+	startFailures = 1
+	executor = newUpgradeExecutor()
+	err = executor.upgrade(context.TODO(), UpgradeOptions{ToVersion: "v1.0.0"})
+	assert.ErrorContains(t, err, "start failed")
+	assert.Equal(t,
+		[]string{"prepare", "backup", "stop", "copy", "replace", "start", "restore", "start"},
+		startFailureEvents)
 }
 
-func TestGetEdgeCoreBinary(t *testing.T) {
+func TestPrepareAndCopyEdgeCoreBinary(t *testing.T) {
 	const wantHostPath = "/etc/kubeedge/upgrade/v1.1.0/edgecore"
 	var checked int
 
@@ -355,7 +419,9 @@ func TestGetEdgeCoreBinary(t *testing.T) {
 			return nil
 		})
 
-	path, err := getEdgeCoreBinary(context.TODO(), opts, cfg)
+	image, ctrcli, err := prepareEdgeCoreImage(context.TODO(), opts, cfg)
+	assert.NoError(t, err)
+	path, err := copyEdgeCoreBinary(context.TODO(), opts, image, ctrcli)
 	assert.NoError(t, err)
 	assert.Equal(t, 3, checked)
 	assert.Equal(t, wantHostPath, path)

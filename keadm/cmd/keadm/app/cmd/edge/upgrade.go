@@ -19,6 +19,7 @@ package edge
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -112,32 +113,74 @@ func (executor *upgradeExecutor) prerun(opts UpgradeOptions) error {
 	return nil
 }
 
-func (executor *upgradeExecutor) upgrade(ctx context.Context, opts UpgradeOptions) error {
-	// Get new edgecore binary from the image.
+func (executor *upgradeExecutor) upgrade(ctx context.Context, opts UpgradeOptions) (retErr error) {
+	// Pull and verify the installation image while the current EdgeCore is still
+	// serving workloads. The old Edged cannot protect a directly-created CRI copy
+	// sandbox, so the actual binary copy is intentionally done after it stops.
 	klog.Infof("Begin to download %s of edgecore", opts.ToVersion)
-	edgecorePath, err := getEdgeCoreBinary(ctx, opts, executor.cfg)
+	image, ctrcli, err := prepareEdgeCoreImage(ctx, opts, executor.cfg)
 	if err != nil {
-		return fmt.Errorf("failed to get edgecore binary, err: %v", err)
+		return fmt.Errorf("failed to prepare edgecore image, err: %v", err)
+	}
+
+	stageDirectory := upgradePath(opts.ToVersion)
+	if err := os.MkdirAll(stageDirectory, 0755); err != nil {
+		return fmt.Errorf("failed to create edgecore upgrade directory %s, err: %v", stageDirectory, err)
 	}
 	defer func() {
-		if err := os.RemoveAll(filepath.Dir(edgecorePath)); err != nil {
+		if err := os.RemoveAll(stageDirectory); err != nil {
 			klog.Errorf("failed to remove edgecore binary: %v", err)
 		}
 	}()
+
+	dest := filepath.Join(constants.KubeEdgeUsrBinPath, constants.KubeEdgeBinaryName)
+	previousEdgeCorePath := filepath.Join(stageDirectory, "previous-edgecore")
+	if err := files.AtomicFileCopy(dest, previousEdgeCorePath); err != nil {
+		return fmt.Errorf("failed to stage current edgecore for automatic recovery, err: %v", err)
+	}
+
 	klog.Infof("Upgrade process start ...")
-	// Stop origin edgecore.
+	// From this point onward, any error may leave the service stopped or
+	// partially stopped. Always attempt recovery before returning the error.
+	recoveryRequired := true
+	replacementAttempted := false
+	defer func() {
+		if retErr == nil || !recoveryRequired {
+			return
+		}
+		if replacementAttempted {
+			if restoreErr := files.AtomicFileCopy(previousEdgeCorePath, dest); restoreErr != nil {
+				retErr = errors.Join(retErr,
+					fmt.Errorf("failed to restore previous edgecore binary: %w", restoreErr))
+			}
+		}
+		if restartErr := runEdgeCore(); restartErr != nil {
+			retErr = errors.Join(retErr,
+				fmt.Errorf("failed to restart edgecore after upgrade failure: %w", restartErr))
+		}
+	}()
+	// Stop the old Edged before creating the CRI resource-copy sandbox. This is
+	// the bootstrap path for versions that do not yet understand the copy guard.
 	if err := util.KillKubeEdgeBinary(constants.KubeEdgeBinaryName); err != nil {
 		return fmt.Errorf("failed to stop edgecore, err: %v", err)
 	}
-	// Copy new edgecore to /usr/local/bin.
-	dest := filepath.Join(constants.KubeEdgeUsrBinPath, constants.KubeEdgeBinaryName)
-	if err := files.FileCopy(edgecorePath, dest); err != nil {
-		return fmt.Errorf("failed to copy edgecore to %s, err: %v", dest, err)
+
+	edgecorePath, err := copyEdgeCoreBinary(ctx, opts, image, ctrcli)
+	if err != nil {
+		return fmt.Errorf("failed to get edgecore binary, err: %v", err)
+	}
+	// AtomicFileCopy can report a durability error after rename(2) committed the
+	// new binary. Mark the replacement attempt first so every error path restores
+	// the staged old binary before EdgeCore is restarted.
+	replacementAttempted = true
+	if err := files.AtomicFileCopy(edgecorePath, dest); err != nil {
+		return fmt.Errorf("failed to atomically replace edgecore at %s, err: %v", dest, err)
 	}
 	// Start new edgecore.
 	if err := runEdgeCore(); err != nil {
 		return fmt.Errorf("failed to start edgecore, err: %v", err)
 	}
+	recoveryRequired = false
 	klog.Info("Upgrade process successful")
 	return nil
 }
@@ -153,31 +196,47 @@ func (executor *upgradeExecutor) newReporter(upgradeID, toVersion string) upgrde
 	return reporter
 }
 
-// getEdgeCoreBinary pulls the installation-package image and obtains the edgecore binary from it.
-// The edgecore binary is copied to the upgrade path, and the filepath is returned.
-func getEdgeCoreBinary(ctx context.Context, opts UpgradeOptions, config *cfgv1alpha2.EdgeCoreConfig) (string, error) {
+// prepareEdgeCoreImage pulls the installation-package image and verifies its
+// digest before EdgeCore is stopped.
+func prepareEdgeCoreImage(
+	ctx context.Context,
+	opts UpgradeOptions,
+	config *cfgv1alpha2.EdgeCoreConfig,
+) (string, containers.ContainerRuntime, error) {
 	ctrcli, err := containers.NewContainerRuntime(
 		config.Modules.Edged.TailoredKubeletConfig.ContainerRuntimeEndpoint,
 		config.Modules.Edged.TailoredKubeletConfig.CgroupDriver)
 	if err != nil {
-		return "", fmt.Errorf("failed to new container runtime, err: %v", err)
+		return "", nil, fmt.Errorf("failed to new container runtime, err: %v", err)
 	}
 	image := opts.Image + ":" + opts.ToVersion
 	// Pull installation-package image
 	if err := ctrcli.PullImage(ctx, image, nil, nil); err != nil {
-		return "", fmt.Errorf("failed to pull image %s, err: %v", image, err)
+		return "", nil, fmt.Errorf("failed to pull image %s, err: %v", image, err)
 	}
 	// If the ImageDigest is not empty, verify the image.
 	if opts.ImageDigest != "" {
 		local, err := ctrcli.GetImageDigest(ctx, image)
 		if err != nil {
-			return "", fmt.Errorf("failed to get image digest of %s, err: %v", image, err)
+			return "", nil, fmt.Errorf("failed to get image digest of %s, err: %v", image, err)
 		}
 		if local != opts.ImageDigest {
-			return "", fmt.Errorf("image digest of %s is not correct, local: %s, expected: %s",
+			return "", nil, fmt.Errorf("image digest of %s is not correct, local: %s, expected: %s",
 				image, local, opts.ImageDigest)
 		}
 	}
+	return image, ctrcli, nil
+}
+
+// copyEdgeCoreBinary obtains the edgecore binary from a prepared image. The
+// caller is responsible for stopping an old EdgeCore that does not understand
+// the resource-copy guard before invoking this function.
+func copyEdgeCoreBinary(
+	ctx context.Context,
+	opts UpgradeOptions,
+	image string,
+	ctrcli containers.ContainerRuntime,
+) (string, error) {
 	// Copy edgecore binary from the image to the upgrade path.
 	containerFilePath := filepath.Join(constants.KubeEdgeUsrBinPath, constants.KubeEdgeBinaryName)
 	hostPath := filepath.Join(upgradePath(opts.ToVersion), constants.KubeEdgeBinaryName)

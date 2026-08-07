@@ -54,6 +54,68 @@ func FileCopy(src, dst string) error {
 	return err
 }
 
+// AtomicFileCopy copies src to a temporary file in dst's directory and then
+// atomically replaces dst. Failures before rename leave the existing
+// destination untouched, which is required when replacing a service binary.
+func AtomicFileCopy(src, dst string) error {
+	sourceFileStat, err := os.Stat(src)
+	if err != nil {
+		return fmt.Errorf("failed to get source file %s stat, err: %v", src, err)
+	}
+	if !sourceFileStat.Mode().IsRegular() {
+		return fmt.Errorf("source file %s is not a regular file", src)
+	}
+
+	source, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open source file %s, err: %v", src, err)
+	}
+	defer source.Close()
+
+	destinationDir := filepath.Dir(dst)
+	temporary, err := os.CreateTemp(destinationDir, "."+filepath.Base(dst)+".kubeedge-upgrade-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary destination for %s, err: %v", dst, err)
+	}
+	temporaryPath := temporary.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+
+	if err := temporary.Chmod(sourceFileStat.Mode().Perm()); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("failed to set temporary destination mode for %s, err: %v", dst, err)
+	}
+	if _, err := io.Copy(temporary, source); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("failed to copy %s to temporary destination for %s, err: %v", src, dst, err)
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("failed to sync temporary destination for %s, err: %v", dst, err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary destination for %s, err: %v", dst, err)
+	}
+	if err := os.Rename(temporaryPath, dst); err != nil {
+		return fmt.Errorf("failed to atomically replace destination %s, err: %v", dst, err)
+	}
+	committed = true
+
+	directory, err := os.Open(destinationDir)
+	if err != nil {
+		return fmt.Errorf("failed to open destination directory %s, err: %v", destinationDir, err)
+	}
+	defer directory.Close()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("failed to sync destination directory %s, err: %v", destinationDir, err)
+	}
+	return nil
+}
+
 func FileExists(path string) bool {
 	_, err := os.Stat(path)
 	if err != nil {

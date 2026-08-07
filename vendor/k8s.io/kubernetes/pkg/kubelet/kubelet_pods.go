@@ -32,6 +32,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -66,6 +67,8 @@ import (
 	volumevalidation "k8s.io/kubernetes/pkg/volume/validation"
 	"k8s.io/kubernetes/third_party/forked/golang/expansion"
 	utilnet "k8s.io/utils/net"
+
+	"github.com/kubeedge/kubeedge/pkg/resourcecopyguard"
 )
 
 const (
@@ -1251,6 +1254,12 @@ func (kl *Kubelet) HandlePodCleanups(ctx context.Context) error {
 		// but which were previously known are terminated by SyncKnownPods().
 		_, knownPod := workingPods[runningPod.ID]
 		if !knownPod {
+			if resourcecopyguard.IsActive(resourcecopyguard.DefaultStateRoot(),
+				runningPod.Name, runningPod.Namespace, string(runningPod.ID), time.Now()) {
+				klog.V(4).InfoS("Keep active KubeEdge resource-copy pod out of orphan cleanup",
+					"podUID", runningPod.ID)
+				continue
+			}
 			one := int64(1)
 			killPodOptions := &KillPodOptions{
 				PodTerminationGracePeriodSecondsOverride: &one,

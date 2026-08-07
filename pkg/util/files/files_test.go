@@ -64,6 +64,43 @@ func TestFileCopy(t *testing.T) {
 	})
 }
 
+func TestAtomicFileCopy(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source")
+	destination := filepath.Join(dir, "destination")
+	if err := os.WriteFile(source, []byte("new edgecore"), 0750); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if err := os.WriteFile(destination, []byte("old edgecore"), 0700); err != nil {
+		t.Fatalf("write destination: %v", err)
+	}
+
+	if err := AtomicFileCopy(source, destination); err != nil {
+		t.Fatalf("AtomicFileCopy() error = %v", err)
+	}
+	content, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatalf("read destination: %v", err)
+	}
+	if string(content) != "new edgecore" {
+		t.Fatalf("destination content = %q", content)
+	}
+	info, err := os.Stat(destination)
+	if err != nil {
+		t.Fatalf("stat destination: %v", err)
+	}
+	if info.Mode().Perm() != 0750 {
+		t.Fatalf("destination mode = %o, want 750", info.Mode().Perm())
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, ".destination.kubeedge-upgrade-*"))
+	if err != nil {
+		t.Fatalf("glob temporary destinations: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary destinations were not cleaned: %v", matches)
+	}
+}
+
 func TestFileExists(t *testing.T) {
 	dir := t.TempDir()
 
