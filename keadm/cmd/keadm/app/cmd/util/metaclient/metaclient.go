@@ -18,6 +18,7 @@ package metaclient
 
 import (
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"k8s.io/client-go/kubernetes"
@@ -78,7 +79,10 @@ func GetKubeConfigWithConfig(config *cfgv1alpha2.EdgeCoreConfig) (*restclient.Co
 	if ok && requireAuthorization {
 		serverCrt := config.Modules.MetaManager.MetaServer.TLSCertFile
 		serverKey := config.Modules.MetaManager.MetaServer.TLSPrivateKeyFile
-		tlsCaFile := config.Modules.MetaManager.MetaServer.TLSCaFile
+		// MetaServer uses a serving certificate issued by the Kubernetes CA
+		// downloaded into its private PKI directory. The configured TLS CA is
+		// the KubeEdge CA and is only used to verify the node client certificate.
+		tlsCaFile := filepath.Join(constants.KubeEdgePath, "pki", "metaserver", "ca.crt")
 
 		kubeConfig.TLSClientConfig.CAFile = tlsCaFile
 		kubeConfig.TLSClientConfig.CertFile = serverCrt

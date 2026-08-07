@@ -4,12 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/pem"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -23,6 +23,8 @@ import (
 	"k8s.io/apiserver/pkg/authentication/request/anonymous"
 	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
 	authnunion "k8s.io/apiserver/pkg/authentication/request/union"
+	x509request "k8s.io/apiserver/pkg/authentication/request/x509"
+	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	authzunion "k8s.io/apiserver/pkg/authorization/union"
 	genericapifilters "k8s.io/apiserver/pkg/endpoints/filters"
@@ -30,7 +32,6 @@ import (
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/server"
 	genericfilters "k8s.io/apiserver/pkg/server/filters"
-	certutil "k8s.io/client-go/util/cert"
 	"k8s.io/client-go/util/keyutil"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
@@ -64,6 +65,60 @@ type MetaServer struct {
 type metaServerAuth struct {
 	Authenticator authenticator.Request
 	Authorizer    authorizer.Authorizer
+}
+
+type verifiedClientCertificateAuthenticator struct{}
+
+func (a *verifiedClientCertificateAuthenticator) AuthenticateRequest(req *http.Request) (*authenticator.Response, bool, error) {
+	if req.TLS == nil || len(req.TLS.VerifiedChains) == 0 {
+		return nil, false, nil
+	}
+	return x509request.CommonNameUserConversion.User(req.TLS.VerifiedChains[0])
+}
+
+type localNodeUpgradeConfirmAuthorizer struct {
+	nodeName string
+}
+
+func (a *localNodeUpgradeConfirmAuthorizer) Authorize(_ context.Context, attrs authorizer.Attributes) (authorizer.Decision, string, error) {
+	requestUser := attrs.GetUser()
+	if requestUser == nil ||
+		!attrs.IsResourceRequest() ||
+		attrs.GetVerb() != "create" ||
+		attrs.GetAPIGroup() != "" ||
+		attrs.GetAPIVersion() != "v1" ||
+		attrs.GetResource() != "taskupgrade" ||
+		attrs.GetName() != "confirm-upgrade" ||
+		attrs.GetSubresource() != "" ||
+		attrs.GetNamespace() != "" {
+		return authorizer.DecisionNoOpinion, "", nil
+	}
+
+	if requestUser.GetName() != "system:node:"+a.nodeName ||
+		!containsString(requestUser.GetGroups(), "system:nodes") ||
+		!hasX509Credential(requestUser) {
+		return authorizer.DecisionNoOpinion, "", nil
+	}
+
+	return authorizer.DecisionAllow, "allow local node certificate to confirm its upgrade", nil
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func hasX509Credential(requestUser user.Info) bool {
+	for _, credentialID := range requestUser.GetExtra()[user.CredentialIDKey] {
+		if strings.HasPrefix(credentialID, "X509SHA256=") {
+			return true
+		}
+	}
+	return false
 }
 
 type AlwaysAllowDiscoveryAuthorizer struct{}
@@ -107,11 +162,14 @@ func buildAuth() *metaServerAuth {
 	// Use union authenticator with anonymous fallback for discovery paths
 	// This follows Kubernetes API Server's standard approach for anonymous access
 	anonymousAuthenticator := anonymous.NewAuthenticator(nil)
-	newAuthenticator := authnunion.NewFailOnError(bearerTokenAuthenticator, anonymousAuthenticator)
+	clientCertificateAuthenticator := &verifiedClientCertificateAuthenticator{}
+	newAuthenticator := authnunion.NewFailOnError(clientCertificateAuthenticator, bearerTokenAuthenticator, anonymousAuthenticator)
 
-	// Use union authorizer with discovery paths allowed first, then RBAC
+	// Allow the local node certificate to confirm only its own upgrade, keep
+	// discovery behavior unchanged, and delegate every other request to RBAC.
 	discoveryAuthorizer := &AlwaysAllowDiscoveryAuthorizer{}
-	unionAuthorizer := authzunion.New(discoveryAuthorizer, newAuthorizer)
+	upgradeConfirmAuthorizer := &localNodeUpgradeConfirmAuthorizer{nodeName: metaserverconfig.Config.NodeName}
+	unionAuthorizer := authzunion.New(upgradeConfirmAuthorizer, discoveryAuthorizer, newAuthorizer)
 
 	return &metaServerAuth{newAuthenticator, unionAuthorizer}
 }
@@ -319,16 +377,12 @@ func (ls *MetaServer) getCertIPs() ([]net.IP, error) {
 }
 
 func (ls *MetaServer) makeTLSConfig() (*tls.Config, error) {
-	ca, err := os.ReadFile(fmt.Sprintf("%s/ca.crt", certificate.CertificatesDir))
+	pool, err := newClientCAPool(
+		filepath.Join(certificate.CertificatesDir, "ca.crt"),
+		metaserverconfig.Config.TLSCaFile,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("read CA failed: %v", err)
-	}
-
-	block, _ := pem.Decode(ca)
-	pool := x509.NewCertPool()
-	ok := pool.AppendCertsFromPEM(pem.EncodeToMemory(&pem.Block{Type: certutil.CertificateBlockType, Bytes: block.Bytes}))
-	if !ok {
-		return nil, errors.New("failed to load ca content")
+		return nil, err
 	}
 
 	return &tls.Config{
@@ -343,4 +397,21 @@ func (ls *MetaServer) makeTLSConfig() (*tls.Config, error) {
 			return cert, nil
 		},
 	}, nil
+}
+
+func newClientCAPool(caFiles ...string) (*x509.CertPool, error) {
+	pool := x509.NewCertPool()
+	for _, caFile := range caFiles {
+		if caFile == "" {
+			continue
+		}
+		ca, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("read client CA file %q failed: %w", caFile, err)
+		}
+		if ok := pool.AppendCertsFromPEM(ca); !ok {
+			return nil, fmt.Errorf("failed to load client CA file %q", caFile)
+		}
+	}
+	return pool, nil
 }
