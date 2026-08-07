@@ -411,6 +411,33 @@ func (uc *UpstreamController) podStatusResponse(msg model.Message, content inter
 	}
 }
 
+// deletePodOnEdge asks the edge node to remove a pod that no longer exists in
+// the Kubernetes API. The UID is required so a delayed delete cannot remove a
+// newer pod that reuses the same namespace and name.
+func (uc *UpstreamController) deletePodOnEdge(msg model.Message, namespace, name string, uid apimachineryType.UID) error {
+	if uid == "" {
+		return fmt.Errorf("pod UID is empty")
+	}
+
+	nodeID, err := messagelayer.GetNodeID(msg)
+	if err != nil {
+		return fmt.Errorf("get node ID: %w", err)
+	}
+	resource, err := messagelayer.BuildResource(nodeID, namespace, model.ResourceTypePod, name)
+	if err != nil {
+		return fmt.Errorf("build pod resource: %w", err)
+	}
+
+	pod := &v1.Pod{ObjectMeta: metaV1.ObjectMeta{Namespace: namespace, Name: name, UID: uid}}
+	delMsg := model.NewMessage("").
+		FillBody(pod).
+		BuildRouter(modules.EdgeControllerModuleName, constants.GroupResource, resource, model.DeleteOperation)
+	if err := uc.messageLayer.Send(*delMsg); err != nil {
+		return fmt.Errorf("send pod delete: %w", err)
+	}
+	return nil
+}
+
 func (uc *UpstreamController) updatePodStatus() {
 	for {
 		select {
@@ -426,31 +453,14 @@ func (uc *UpstreamController) updatePodStatus() {
 				for _, podStatus := range podStatuses {
 					getPod, err := uc.kubeClient.CoreV1().Pods(namespace).Get(utilcontext.FromMessage(context.Background(), msg), podStatus.Name, metaV1.GetOptions{})
 					if (err == nil && getPod.UID != podStatus.UID) || errors.IsNotFound(err) {
-						klog.Warningf("message: %s, pod not found, namespace: %s, name: %s", msg.GetID(), namespace, podStatus.Name)
+						klog.V(4).Infof("message: %s, stale pod status received, namespace: %s, name: %s, UID: %s", msg.GetID(), namespace, podStatus.Name, podStatus.UID)
 
 						// send response message to edged
 						uc.podStatusResponse(msg, common.MessageSuccessfulContent)
 
 						// Send request to delete this pod on edge side
-						delMsg := model.NewMessage("")
-						nodeID, err := messagelayer.GetNodeID(msg)
-						if err != nil {
-							klog.Warningf("Get node ID failed with error: %s", err)
-							continue
-						}
-						resource, err := messagelayer.BuildResource(nodeID, namespace, model.ResourceTypePod, podStatus.Name)
-						if err != nil {
-							klog.Warningf("Built message resource failed with error: %s", err)
-							continue
-						}
-						pod := &v1.Pod{}
-						pod.Namespace, pod.Name = namespace, podStatus.Name
-						delMsg.Content = pod
-						delMsg.BuildRouter(modules.EdgeControllerModuleName, constants.GroupResource, resource, model.DeleteOperation)
-						if err := uc.messageLayer.Send(*delMsg); err != nil {
-							klog.Warningf("Send message failed with error: %s, operation: %s, resource: %s", err, delMsg.GetOperation(), delMsg.GetResource())
-						} else {
-							klog.V(4).Infof("Send message successfully, operation: %s, resource: %s", delMsg.GetOperation(), delMsg.GetResource())
+						if err := uc.deletePodOnEdge(msg, namespace, podStatus.Name, podStatus.UID); err != nil {
+							klog.Errorf("message: %s, delete stale pod on edge failed: %v, namespace: %s, name: %s, UID: %s", msg.GetID(), err, namespace, podStatus.Name, podStatus.UID)
 						}
 
 						continue
@@ -810,6 +820,15 @@ func queryInner(uc *UpstreamController, msg model.Message, queryType string) {
 		var object metaV1.Object
 		object, err = kubeClientGet(uc, namespace, name, queryType, msg)
 		if errors.IsNotFound(err) {
+			if queryType == model.ResourceTypeServiceAccountToken {
+				if podName, podUID, stalePod := boundPodNotFoundFromMessage(msg, err); stalePod {
+					klog.V(4).Infof("message: %s, token requested for stale pod, node: %s, namespace: %s, name: %s, UID: %s", msg.GetID(), nodeID, namespace, podName, podUID)
+					if deleteErr := uc.deletePodOnEdge(msg, namespace, podName, podUID); deleteErr != nil {
+						klog.Errorf("message: %s, delete stale pod on edge failed: %v, node: %s, namespace: %s, name: %s, UID: %s", msg.GetID(), deleteErr, nodeID, namespace, podName, podUID)
+					}
+					return
+				}
+			}
 			klog.Warningf("message: %s process failure, resource not found, namespace: %s, name: %s", msg.GetID(), namespace, name)
 			return
 		}
@@ -884,11 +903,47 @@ func (uc *UpstreamController) getServiceAccountToken(namespace string, name stri
 
 	tokenRequest, err := uc.kubeClient.CoreV1().ServiceAccounts(namespace).CreateToken(utilcontext.FromMessage(context.TODO(), msg), name, &tr, metaV1.CreateOptions{})
 	if err != nil {
-		klog.Errorf("apiserver get service account token failed: err %v", err)
+		if _, _, stalePod := boundPodNotFound(&tr, err); !stalePod {
+			klog.Errorf("apiserver get service account token failed: err %v", err)
+		}
 		return nil, err
 	}
 
 	return tokenRequest, nil
+}
+
+func boundPodNotFound(tr *authenticationv1.TokenRequest, err error) (string, apimachineryType.UID, bool) {
+	if tr.Spec.BoundObjectRef == nil || !strings.EqualFold(tr.Spec.BoundObjectRef.Kind, model.ResourceTypePod) || !errors.IsNotFound(err) {
+		return "", "", false
+	}
+
+	var apiStatus errors.APIStatus
+	if !stderrors.As(err, &apiStatus) {
+		return "", "", false
+	}
+	details := apiStatus.Status().Details
+	if details == nil || strings.TrimSuffix(strings.ToLower(details.Kind), "s") != model.ResourceTypePod {
+		return "", "", false
+	}
+	if details.Name != "" && details.Name != tr.Spec.BoundObjectRef.Name {
+		return "", "", false
+	}
+	if tr.Spec.BoundObjectRef.Name == "" || tr.Spec.BoundObjectRef.UID == "" {
+		return "", "", false
+	}
+	return tr.Spec.BoundObjectRef.Name, tr.Spec.BoundObjectRef.UID, true
+}
+
+func boundPodNotFoundFromMessage(msg model.Message, err error) (string, apimachineryType.UID, bool) {
+	data, contentErr := msg.GetContentData()
+	if contentErr != nil {
+		return "", "", false
+	}
+	tr := authenticationv1.TokenRequest{}
+	if unmarshalErr := json.Unmarshal(data, &tr); unmarshalErr != nil {
+		return "", "", false
+	}
+	return boundPodNotFound(&tr, err)
 }
 
 func (uc *UpstreamController) queryPersistentVolume() {
@@ -1135,41 +1190,88 @@ func (uc *UpstreamController) patchPod() {
 			klog.Warning("stop patchPod")
 			return
 		case msg := <-uc.patchPodChan:
-			klog.V(5).Infof("message: %s, operation is: %s, and resource is %s", msg.GetID(), msg.GetOperation(), msg.GetResource())
-
-			namespace, err := messagelayer.GetNamespace(msg)
-			if err != nil {
-				klog.Warningf("message: %s process failure, get namespace failed with error: %v", msg.GetID(), err)
-				continue
-			}
-			name, err := messagelayer.GetResourceName(msg)
-			if err != nil {
-				klog.Warningf("message: %s process failure, get resource name failed with error: %v", msg.GetID(), err)
-				continue
-			}
-
-			patchBytes, err := msg.GetContentData()
-			if err != nil {
-				klog.Warningf("message: %s process failure, get data failed with error: %v", msg.GetID(), err)
-				continue
-			}
-
-			updatedPod, err := uc.kubeClient.CoreV1().Pods(namespace).Patch(utilcontext.FromMessage(context.TODO(), msg), name, apimachineryType.StrategicMergePatchType, patchBytes, metaV1.PatchOptions{}, "status")
-			if err != nil {
-				klog.Errorf("message: %s process failure, patch pod failed with error: %v, namespace: %s, name: %s", msg.GetID(), err, namespace, name)
-			}
-
-			resMsg := model.NewMessage(msg.GetID()).
-				SetResourceVersion(updatedPod.ResourceVersion).
-				FillBody(&edgeapi.ObjectResp{Object: updatedPod, Err: err}).
-				BuildRouter(modules.EdgeControllerModuleName, constants.GroupResource, msg.GetResource(), model.ResponseOperation)
-			if err = uc.messageLayer.Response(*resMsg); err != nil {
-				klog.Errorf("Message: %s process failure, response failed with error: %v", msg.GetID(), err)
-				continue
-			}
-
-			klog.V(4).Infof("message: %s, patch pod successfully, namespace: %s, name: %s", msg.GetID(), namespace, name)
+			uc.patchPodStatus(msg)
 		}
+	}
+}
+
+func podUIDFromPatch(patchBytes []byte) (apimachineryType.UID, error) {
+	patch := struct {
+		Metadata struct {
+			UID apimachineryType.UID `json:"uid"`
+		} `json:"metadata"`
+	}{}
+	if err := json.Unmarshal(patchBytes, &patch); err != nil {
+		return "", fmt.Errorf("unmarshal pod patch metadata: %w", err)
+	}
+	if patch.Metadata.UID == "" {
+		return "", fmt.Errorf("pod patch UID is empty")
+	}
+	return patch.Metadata.UID, nil
+}
+
+func (uc *UpstreamController) patchPodStatus(msg model.Message) {
+	klog.V(5).Infof("message: %s, operation is: %s, and resource is %s", msg.GetID(), msg.GetOperation(), msg.GetResource())
+
+	namespace, err := messagelayer.GetNamespace(msg)
+	if err != nil {
+		klog.Warningf("message: %s process failure, get namespace failed with error: %v", msg.GetID(), err)
+		return
+	}
+	name, err := messagelayer.GetResourceName(msg)
+	if err != nil {
+		klog.Warningf("message: %s process failure, get resource name failed with error: %v", msg.GetID(), err)
+		return
+	}
+
+	patchBytes, err := msg.GetContentData()
+	if err != nil {
+		klog.Warningf("message: %s process failure, get data failed with error: %v", msg.GetID(), err)
+		return
+	}
+
+	updatedPod, patchErr := uc.kubeClient.CoreV1().Pods(namespace).Patch(utilcontext.FromMessage(context.TODO(), msg), name, apimachineryType.StrategicMergePatchType, patchBytes, metaV1.PatchOptions{}, "status")
+	if errors.IsNotFound(patchErr) {
+		podUID, uidErr := podUIDFromPatch(patchBytes)
+		if uidErr == nil {
+			klog.V(4).Infof("message: %s, patch received for stale pod, namespace: %s, name: %s, UID: %s", msg.GetID(), namespace, name, podUID)
+			resourceVersion := ""
+			if updatedPod != nil {
+				resourceVersion = updatedPod.ResourceVersion
+			}
+			resMsg := model.NewMessage(msg.GetID()).
+				SetResourceVersion(resourceVersion).
+				FillBody(&edgeapi.ObjectResp{Object: updatedPod, Err: patchErr}).
+				BuildRouter(modules.EdgeControllerModuleName, constants.GroupResource, msg.GetResource(), model.ResponseOperation)
+			if responseErr := uc.messageLayer.Response(*resMsg); responseErr != nil {
+				klog.Errorf("message: %s process failure, response failed with error: %v", msg.GetID(), responseErr)
+			}
+			if deleteErr := uc.deletePodOnEdge(msg, namespace, name, podUID); deleteErr != nil {
+				klog.Errorf("message: %s, delete stale pod on edge failed: %v, namespace: %s, name: %s, UID: %s", msg.GetID(), deleteErr, namespace, name, podUID)
+			}
+			return
+		}
+		klog.Errorf("message: %s, cannot clean up stale pod: %v, namespace: %s, name: %s", msg.GetID(), uidErr, namespace, name)
+	}
+	if patchErr != nil {
+		klog.Errorf("message: %s process failure, patch pod failed with error: %v, namespace: %s, name: %s", msg.GetID(), patchErr, namespace, name)
+	}
+
+	resourceVersion := ""
+	if updatedPod != nil {
+		resourceVersion = updatedPod.ResourceVersion
+	}
+	resMsg := model.NewMessage(msg.GetID()).
+		SetResourceVersion(resourceVersion).
+		FillBody(&edgeapi.ObjectResp{Object: updatedPod, Err: patchErr}).
+		BuildRouter(modules.EdgeControllerModuleName, constants.GroupResource, msg.GetResource(), model.ResponseOperation)
+	if responseErr := uc.messageLayer.Response(*resMsg); responseErr != nil {
+		klog.Errorf("message: %s process failure, response failed with error: %v", msg.GetID(), responseErr)
+		return
+	}
+
+	if patchErr == nil {
+		klog.V(4).Infof("message: %s, patch pod successfully, namespace: %s, name: %s", msg.GetID(), namespace, name)
 	}
 }
 

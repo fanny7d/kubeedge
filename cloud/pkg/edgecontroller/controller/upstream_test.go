@@ -31,11 +31,15 @@ import (
 	certificatesv1 "k8s.io/api/certificates/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/kubeedge/api/apis/componentconfig/cloudcore/v1alpha1"
 	rulesv1 "github.com/kubeedge/api/apis/rules/v1"
@@ -73,6 +77,25 @@ func (m *MockMessageLayer) Receive() (model.Message, error) {
 func (m *MockMessageLayer) Response(message model.Message) error {
 	m.ResponseMessages = append(m.ResponseMessages, message)
 	return nil
+}
+
+func assertPodDeleteMessage(t *testing.T, messages []model.Message, nodeID, namespace, name string, uid types.UID) {
+	t.Helper()
+	expectedResource := fmt.Sprintf("node/%s/%s/%s/%s", nodeID, namespace, model.ResourceTypePod, name)
+	for _, msg := range messages {
+		if msg.GetOperation() != model.DeleteOperation || msg.GetResource() != expectedResource {
+			continue
+		}
+		pod, ok := msg.GetContent().(*corev1.Pod)
+		if !ok {
+			t.Fatalf("pod delete content type = %T, want *corev1.Pod", msg.GetContent())
+		}
+		if pod.Namespace != namespace || pod.Name != name || pod.UID != uid {
+			t.Fatalf("pod delete content = %s/%s UID %s, want %s/%s UID %s", pod.Namespace, pod.Name, pod.UID, namespace, name, uid)
+		}
+		return
+	}
+	t.Fatalf("pod delete message for resource %s was not sent", expectedResource)
 }
 
 var defaultConf = v1alpha1.NewDefaultCloudCoreConfig()
@@ -492,6 +515,108 @@ func TestPatchPod(t *testing.T) {
 	}
 }
 
+func TestPatchPodNotFoundDeletesStalePodOnEdge(t *testing.T) {
+	setupTest(t)
+
+	podName := "stale-pod"
+	podNamespace := testNamespace
+	podUID := types.UID("stale-pod-uid")
+	resource := fmt.Sprintf("node/%s/%s/%s/%s", defaultNodeID, podNamespace, model.ResourceTypePodPatch, podName)
+	msg := model.Message{
+		Header:  model.MessageHeader{ID: "test-stale-pod-patch"},
+		Router:  model.MessageRoute{Resource: resource, Operation: model.PatchOperation},
+		Content: fmt.Sprintf(`{"metadata":{"uid":%q},"status":{"phase":"Running"}}`, podUID),
+	}
+
+	UC.patchPodStatus(msg)
+
+	if len(mockMessageLayer.ResponseMessages) != 1 {
+		t.Fatalf("response message count = %d, want 1", len(mockMessageLayer.ResponseMessages))
+	}
+	response := mockMessageLayer.ResponseMessages[0]
+	if response.GetParentID() != msg.GetID() {
+		t.Fatalf("stale pod response parent = %q, want %q", response.GetParentID(), msg.GetID())
+	}
+	podResponse, ok := response.GetContent().(*edgeapi.ObjectResp)
+	if !ok || !apierrors.IsNotFound(podResponse.Err) {
+		t.Fatalf("stale pod response content = %T/%v, want ObjectResp with NotFound", response.GetContent(), response.GetContent())
+	}
+	assertPodDeleteMessage(t, mockMessageLayer.SendMessages, defaultNodeID, podNamespace, podName, podUID)
+}
+
+func TestServiceAccountTokenBoundPodNotFoundDeletesStalePodOnEdge(t *testing.T) {
+	setupTest(t)
+
+	podName := "stale-token-pod"
+	podUID := types.UID("stale-token-pod-uid")
+	clientset, ok := UC.kubeClient.(*fake.Clientset)
+	if !ok {
+		t.Fatalf("kube client type = %T, want *fake.Clientset", UC.kubeClient)
+	}
+	clientset.PrependReactor("create", "serviceaccounts", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() != "token" {
+			return true, nil, fmt.Errorf("unexpected service account create subresource %q", action.GetSubresource())
+		}
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, podName)
+	})
+
+	tokenRequest := authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{
+			BoundObjectRef: &authenticationv1.BoundObjectReference{
+				Kind:       "Pod",
+				APIVersion: "v1",
+				Name:       podName,
+				UID:        podUID,
+			},
+		},
+	}
+	tokenRequestData, err := json.Marshal(tokenRequest)
+	if err != nil {
+		t.Fatalf("marshal token request: %v", err)
+	}
+	resource := fmt.Sprintf("node/%s/%s/%s/%s", defaultNodeID, testNamespace, model.ResourceTypeServiceAccountToken, "default")
+	msg := model.Message{
+		Header:  model.MessageHeader{ID: "test-stale-pod-token"},
+		Router:  model.MessageRoute{Resource: resource, Operation: model.QueryOperation},
+		Content: string(tokenRequestData),
+	}
+
+	queryInner(UC, msg, model.ResourceTypeServiceAccountToken)
+
+	assertPodDeleteMessage(t, mockMessageLayer.SendMessages, defaultNodeID, testNamespace, podName, podUID)
+}
+
+func TestBoundPodNotFoundOnlyMatchesBoundPod(t *testing.T) {
+	podName := "bound-pod"
+	podUID := types.UID("bound-pod-uid")
+	tokenRequest := &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{
+			BoundObjectRef: &authenticationv1.BoundObjectReference{Kind: "Pod", Name: podName, UID: podUID},
+		},
+	}
+
+	tests := []struct {
+		name  string
+		err   error
+		match bool
+	}{
+		{name: "bound pod missing", err: apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, podName), match: true},
+		{name: "service account missing", err: apierrors.NewNotFound(schema.GroupResource{Resource: "serviceaccounts"}, "default"), match: false},
+		{name: "different pod missing", err: apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "different-pod"), match: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			name, uid, match := boundPodNotFound(tokenRequest, tt.err)
+			if match != tt.match {
+				t.Fatalf("boundPodNotFound match = %t, want %t", match, tt.match)
+			}
+			if match && (name != podName || uid != podUID) {
+				t.Fatalf("boundPodNotFound = %s/%s, want %s/%s", name, uid, podName, podUID)
+			}
+		})
+	}
+}
+
 func TestMain(m *testing.M) {
 	defaultConf.Modules.EdgeController.Enable = true
 	m.Run()
@@ -593,6 +718,7 @@ func TestPodStatusErrorPaths(t *testing.T) {
 
 	UC.podStatusChan <- msg1
 	time.Sleep(500 * time.Millisecond)
+	assertPodDeleteMessage(t, mockMessageLayer.SendMessages, defaultNodeID, podNamespace, "non-existent-pod", podUID)
 
 	// Test case 2: UID mismatch
 	msg2 := createPodStatusMessage(
@@ -606,6 +732,7 @@ func TestPodStatusErrorPaths(t *testing.T) {
 
 	UC.podStatusChan <- msg2
 	time.Sleep(500 * time.Millisecond)
+	assertPodDeleteMessage(t, mockMessageLayer.SendMessages, defaultNodeID, podNamespace, podName, wrongUID)
 
 	// Test case 3: Pod with deletionTimestamp and terminal phase
 	pod.DeletionTimestamp = &metav1.Time{Time: time.Now()}
