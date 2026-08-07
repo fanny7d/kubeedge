@@ -134,13 +134,22 @@ func (executor *NodeTaskExecutor) Execute(ctx context.Context, connectedNodes []
 				"nodename", task.NodeName())
 			continue
 		}
+		// Every CloudCore replica watches the same node job, but an edge node has
+		// a session with only one replica. A replica that does not own the session
+		// must leave the task pending for the owning replica instead of marking the
+		// shared task status as failed.
+		if !slices.In(connectedNodes, task.NodeName()) {
+			executor.logger.V(2).Info("the node is managed by another CloudCore instance, skip it",
+				"nodename", task.NodeName())
+			continue
+		}
 
 		executor.logger.V(2).Info("acquire a pool item ...")
 		executor.pool.Acquire()
 		executor.logger.V(2).Info("do node action", "nodename", task.NodeName())
 		executor.wg.Add(1)
 
-		if err := executor.executeTask(ctx, task, connectedNodes); err != nil {
+		if err := executor.executeTask(ctx, task); err != nil {
 			task.SetPhase(operationsv1alpha2.NodeTaskPhaseFailure, err.Error())
 			executor.FinishTask()
 		} else {
@@ -154,11 +163,7 @@ func (executor *NodeTaskExecutor) Execute(ctx context.Context, connectedNodes []
 }
 
 // executeTask executes the node task. It sends a message to the edge node to execute the task.
-func (executor *NodeTaskExecutor) executeTask(_ctx context.Context, task wrap.NodeJobTask, connectedNodes []string,
-) error {
-	if !slices.In(connectedNodes, task.NodeName()) {
-		return fmt.Errorf("the node %s is not connected to the current cloudcore instance", task.NodeName())
-	}
+func (executor *NodeTaskExecutor) executeTask(_ctx context.Context, task wrap.NodeJobTask) error {
 	msgres := taskmsg.Resource{
 		APIVersion:   operationsv1alpha2.SchemeGroupVersion.String(),
 		ResourceType: executor.job.ResourceType(),

@@ -100,7 +100,7 @@ func TestExecute(t *testing.T) {
 					NodeName: "node3",
 					Phase:    operationsv1alpha2.NodeTaskPhasePending,
 				},
-				{ // not in connectedNodes, failed
+				{ // not in connectedNodes, handled by another CloudCore replica
 					NodeName: "node4",
 					Phase:    operationsv1alpha2.NodeTaskPhasePending,
 				},
@@ -136,8 +136,8 @@ func TestExecute(t *testing.T) {
 	assert.Equal(t, operationsv1alpha2.NodeTaskPhaseInProgress, obj.Status.NodeStatus[0].Phase)
 	assert.Equal(t, operationsv1alpha2.NodeTaskPhaseInProgress, obj.Status.NodeStatus[1].Phase)
 	assert.Equal(t, operationsv1alpha2.NodeTaskPhaseInProgress, obj.Status.NodeStatus[2].Phase)
-	assert.Equal(t, operationsv1alpha2.NodeTaskPhaseFailure, obj.Status.NodeStatus[3].Phase)
-	assert.Contains(t, obj.Status.NodeStatus[3].Reason, "the node node4 is not connected to the current cloudcore instance")
+	assert.Equal(t, operationsv1alpha2.NodeTaskPhasePending, obj.Status.NodeStatus[3].Phase)
+	assert.Empty(t, obj.Status.NodeStatus[3].Reason)
 	assert.Equal(t, operationsv1alpha2.NodeTaskPhaseFailure, obj.Status.NodeStatus[4].Phase)
 	assert.Contains(t, obj.Status.NodeStatus[4].Reason, "failed to send message to edge")
 }
