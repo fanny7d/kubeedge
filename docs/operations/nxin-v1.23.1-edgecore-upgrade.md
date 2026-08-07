@@ -1,6 +1,6 @@
 # NXIN KubeEdge v1.23.1 云边升级方案
 
-本文用于把现网云侧和边缘节点统一升级到 `v1.23.1-nxin.4`。所有正式
+本文用于把现网云侧和边缘节点统一升级到 `v1.23.1-nxin.5`。所有正式
 制品必须来自上游 `v1.23.1` tag（commit
 `1a7ee88d3c61dc781cc9c9053066ab3d38519dd5`）派生的同一个 NXIN 不可变
 tag，禁止使用 `master` 或移动中的 release 分支构建。
@@ -23,13 +23,13 @@ tag，禁止使用 `master` 或移动中的 release 分支构建。
 
 | 当前 EdgeCore | 升级入口 | 原因 |
 | --- | --- | --- |
-| 已是正式 `.4` 且 hash 一致 | 不重复升级，只验收 | 避免无意义重启 |
-| `.4-rc.1`、`.4-rc.2` 或已包含完整 copy labels 的版本 | 官方 NodeUpgradeJob | 当前 EdgeCore 能安全完成 Check 的 CRI copy |
-| `.3` 及更早 NXIN/上游版本 | 先带外分发正式 `.4` keadm，再执行摘要锁定的本地 bootstrap | 老 EdgeCore 的 Check 可能清理临时 copy sandbox，不能把首次升级完全交给 NodeUpgradeJob |
+| 已是正式 `.5` 且 hash 一致 | 不重复升级，只验收 | 避免无意义重启 |
+| `.4`、`.4-rc.1`、`.4-rc.2` 或已包含完整 copy labels 的版本 | 官方 NodeUpgradeJob，但必须先通过 watchdog 门禁 | 当前 EdgeCore 能安全完成 Check 的 CRI copy；`.4` 的启动竞态使其不能继续放量 |
+| `.3` 及更早 NXIN/上游版本 | 先带外分发正式 `.5` keadm，再执行摘要锁定的本地 bootstrap | 老 EdgeCore 的 Check 可能清理临时 copy sandbox，不能把首次升级完全交给 NodeUpgradeJob |
 | 版本、二进制 hash、数据库或管理链路不明 | 隔离并人工处理 | 不允许在未知状态下批量升级 |
 
 带外分发只替换 keadm，不停止 EdgeCore。必须通过 SSH、edge access agent 或其他
-独立管理链路传输，并在原子替换前验证 release manifest 中的 SHA256。正式 `.4`
+独立管理链路传输，并在原子替换前验证 release manifest 中的 SHA256。正式 `.5`
 keadm 保留了历史 EdgeCore bootstrap、失败恢复和旧二进制重启逻辑。
 
 ## 3. 升级顺序
@@ -37,7 +37,7 @@ keadm 保留了历史 EdgeCore bootstrap、失败恢复和旧二进制重启逻�
 ### 3.1 云侧先行
 
 1. 备份当前 ACK deployment、service、NLB 标识、CRD 和 controller 配置。
-2. 先更新匹配 `.4` 的 CRD/controller-manager，再滚动 CloudCore。
+2. 先更新匹配 `.5` 的 CRD/controller-manager，再滚动 CloudCore。
 3. CloudCore 三副本逐个更新；任何时刻至少两个 Ready，禁止重建或更换受保护的
    NLB、Service 地址和证书 Secret。
 4. 每个副本验证 image digest、版本、leader/session owner、Ready、restart count
@@ -58,13 +58,36 @@ keadm 保留了历史 EdgeCore bootstrap、失败恢复和旧二进制重启逻�
 - installation-package 只清理“无容器引用且可从仓库恢复”的精确历史版本，禁止
   执行不加选择的 image prune；
 - 至少一条不依赖 EdgeCore 的管理通道可用。
+- 记录 boot ID、Ready sandbox ID、运行中 container ID、attempt、Pod restart
+  count 和 EdgeCore `NRestarts`，升级后必须逐项比较；
+- 如果 `/dev/watchdog*` 已启用，查明 timeout、驱动和实际 feeder。feeder 若位于
+  EdgeCore 管理的 Pod 中，必须先启动并验证独立宿主机 feeder；无法安全建立时阻断
+  升级，不能赌业务 Pod 在重启窗口内一定存活。
+
+本次 ARM64 canary 的 `dw_wdt` 不支持 magic close，业务 Pod 中的 feeder 约每 11 秒
+短开设备投喂，硬件 timeout 为 44 秒。测试窗口使用独立 transient systemd guard：
+
+```bash
+systemd-run \
+  --unit=nxin-edge-upgrade-watchdog-guard \
+  --description='NXIN edge upgrade watchdog guard' \
+  --property=Restart=always \
+  --property=RestartSec=1 \
+  --property=KillMode=control-group \
+  /bin/bash -c \
+  'while :; do printf nxin-edge-upgrade-guard >/dev/watchdog || :; sleep 5; done'
+```
+
+必须先验证 guard 为 `active`、其 `NRestarts=0`，且原 feeder 仍持续输出成功日志。
+只有新 EdgeCore、全部业务容器和原 feeder 完成稳定观察后才能停止 guard；停止前后
+都要确认另一 feeder 的投喂间隔小于硬件 timeout。
 
 ### 3.3 历史节点 bootstrap
 
 以下变量必须来自正式 release manifest：
 
 ```bash
-TARGET_VERSION=v1.23.1-nxin.4
+TARGET_VERSION=v1.23.1-nxin.5
 INSTALL_IMAGE=nxin-acr-registry.cn-beijing.cr.aliyuncs.com/kubeedge/installation-package
 INSTALL_DIGEST=sha256:<arm64-verified-oci-index-digest>
 ```
@@ -94,9 +117,9 @@ INSTALL_DIGEST=sha256:<arm64-verified-oci-index-digest>
 apiVersion: operations.kubeedge.io/v1alpha2
 kind: NodeUpgradeJob
 metadata:
-  name: upgrade-<node>-v1231-nxin4
+  name: upgrade-<node>-v1231-nxin5
 spec:
-  version: v1.23.1-nxin.4
+  version: v1.23.1-nxin.5
   nodeNames:
     - <node>
   image: nxin-acr-registry.cn-beijing.cr.aliyuncs.com/kubeedge/installation-package
@@ -130,6 +153,7 @@ RBAC、复用 Pod token 或关闭 `requireAuthorization`。最终要求 `Check`�
 
 - EdgeCore 和 keadm 的 SHA256、版本、commit、clean tree、Go 版本和 ARM64 平台；
 - Node Ready、上报版本正确，所有业务 Pod/容器 Ready，restart count 不增长；
+- boot ID、Ready sandbox ID、运行中 container ID 和 attempt 与预检基线一致；
 - EdgeCore `NRestarts=0`，containerd、agent、NPC 全程在线；
 - 数据库完整，无终态 upgrade task、upgrade report、copy guard 和临时容器残留；
 - 备份目录包含升级前 EdgeCore、配置和完整数据库；
@@ -148,6 +172,7 @@ RBAC、复用 Pod token 或关闭 `requireAuthorization`。最终要求 `Check`�
 ```
 
 回滚期间仍要保持 containerd 和独立管理通道在线。回滚后重复完整验收，并保留失败
-任务、journal 和 release manifest 作为证据。只有确认 `.4` 云侧与旧边侧不兼容或
-云侧自身不健康时，才按 ACK 的受保护滚动流程把 CloudCore/controller 回滚到上一
-套同 tag 制品；不得删除或重建 NLB。
+任务、journal 和 release manifest 作为证据。`.4` 边端包含已确认的启动竞态，
+不得在没有独立 watchdog guard 的情况下自动回滚到 `.4`。只有确认 `.5` 云侧与
+旧边侧不兼容或云侧自身不健康时，才按 ACK 的受保护滚动流程把
+CloudCore/controller 回滚到上一套同 tag 制品；不得删除或重建 NLB。
