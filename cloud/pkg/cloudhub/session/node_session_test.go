@@ -17,6 +17,7 @@ limitations under the License.
 package session
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -345,7 +346,7 @@ func TestSaveNamespaceResourceSuccessDoesNotMoveObjectSyncStatusBackward(t *test
 	client := fake.NewSimpleClientset()
 	existingObjectSync := tf.NewObjectSync(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "5"), "Pod")
 	if _, err := client.ReliablesyncsV1alpha1().ObjectSyncs(tf.TestNamespace).Create(
-		t.Context(), existingObjectSync, metav1.CreateOptions{}); err != nil {
+		context.Background(), existingObjectSync, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed to seed objectSync: %v", err)
 	}
 
@@ -360,7 +361,7 @@ func TestSaveNamespaceResourceSuccessDoesNotMoveObjectSyncStatusBackward(t *test
 	session.saveNamespaceResourceSuccess(tf.NewPodMessage(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, "3"), "update"))
 
 	got, err := client.ReliablesyncsV1alpha1().ObjectSyncs(tf.TestNamespace).Get(
-		t.Context(), existingObjectSync.Name, metav1.GetOptions{})
+		context.Background(), existingObjectSync.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to get objectSync: %v", err)
 	}
@@ -373,7 +374,7 @@ func TestSaveNonNamespaceResourceSuccessDoesNotMoveClusterObjectSyncStatusBackwa
 	client := fake.NewSimpleClientset()
 	existingClusterObjectSync := tf.NewClusterObjectSync(tf.NewTestNodeResource(tf.TestNodeID, tf.TestNodeUID, "5"), "Node")
 	if _, err := client.ReliablesyncsV1alpha1().ClusterObjectSyncs().Create(
-		t.Context(), existingClusterObjectSync, metav1.CreateOptions{}); err != nil {
+		context.Background(), existingClusterObjectSync, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed to seed clusterObjectSync: %v", err)
 	}
 
@@ -388,7 +389,7 @@ func TestSaveNonNamespaceResourceSuccessDoesNotMoveClusterObjectSyncStatusBackwa
 	session.saveNonNamespaceResourceSuccess(tf.NewNodeMessage(tf.NewTestNodeResource(tf.TestNodeID, tf.TestNodeUID, "3"), "update"))
 
 	got, err := client.ReliablesyncsV1alpha1().ClusterObjectSyncs().Get(
-		t.Context(), existingClusterObjectSync.Name, metav1.GetOptions{})
+		context.Background(), existingClusterObjectSync.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to get clusterObjectSync: %v", err)
 	}

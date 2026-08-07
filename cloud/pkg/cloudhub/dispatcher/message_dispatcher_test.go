@@ -17,6 +17,7 @@ limitations under the License.
 package dispatcher
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"testing"
@@ -380,7 +381,7 @@ func TestEnqueueAckMessageInitializesExistingObjectSyncAfterCreateRace(t *testin
 	existingObjectSync := tf.NewObjectSync(tf.NewTestPodResource(tf.TestPodName, tf.TestPodUID, ""), "Pod")
 	existingObjectSync.Status.ObjectResourceVersion = ""
 	if _, err := client.ReliablesyncsV1alpha1().ObjectSyncs(tf.TestNamespace).Create(
-		t.Context(), existingObjectSync, metav1.CreateOptions{}); err != nil {
+		context.Background(), existingObjectSync, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed to seed objectSync: %v", err)
 	}
 
@@ -400,7 +401,7 @@ func TestEnqueueAckMessageInitializesExistingObjectSyncAfterCreateRace(t *testin
 		t.Fatalf("expected message to be enqueued after objectSync create race")
 	}
 	got, err := client.ReliablesyncsV1alpha1().ObjectSyncs(tf.TestNamespace).Get(
-		t.Context(), existingObjectSync.Name, metav1.GetOptions{})
+		context.Background(), existingObjectSync.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to get objectSync: %v", err)
 	}
@@ -419,7 +420,7 @@ func TestEnqueueAckMessageInitializesExistingClusterObjectSyncAfterCreateRace(t 
 	existingClusterObjectSync := tf.NewClusterObjectSync(tf.NewTestNodeResource(tf.TestNodeID, tf.TestNodeUID, ""), "Node")
 	existingClusterObjectSync.Status.ObjectResourceVersion = ""
 	if _, err := client.ReliablesyncsV1alpha1().ClusterObjectSyncs().Create(
-		t.Context(), existingClusterObjectSync, metav1.CreateOptions{}); err != nil {
+		context.Background(), existingClusterObjectSync, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed to seed clusterObjectSync: %v", err)
 	}
 
@@ -439,7 +440,7 @@ func TestEnqueueAckMessageInitializesExistingClusterObjectSyncAfterCreateRace(t 
 		t.Fatalf("expected message to be enqueued after clusterObjectSync create race")
 	}
 	got, err := client.ReliablesyncsV1alpha1().ClusterObjectSyncs().Get(
-		t.Context(), existingClusterObjectSync.Name, metav1.GetOptions{})
+		context.Background(), existingClusterObjectSync.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to get clusterObjectSync: %v", err)
 	}
@@ -480,7 +481,7 @@ func TestEnqueueAckMessagePersistsServiceAccountAccessWithoutLocalSession(t *tes
 	}
 	objectSyncName := synccontroller.BuildObjectSyncName(tf.TestNodeID, string(serviceAccountAccess.UID))
 	got, err := client.ReliablesyncsV1alpha1().ObjectSyncs(tf.TestNamespace).Get(
-		t.Context(), objectSyncName, metav1.GetOptions{})
+		context.Background(), objectSyncName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("expected shared objectSync to be persisted without a local node session: %v", err)
 	}
@@ -516,7 +517,7 @@ func TestEnqueueAckMessagePersistsClusterObjectSyncWithoutLocalSession(t *testin
 	}
 	clusterObjectSyncName := synccontroller.BuildObjectSyncName(tf.TestNodeID, string(node.UID))
 	got, err := client.ReliablesyncsV1alpha1().ClusterObjectSyncs().Get(
-		t.Context(), clusterObjectSyncName, metav1.GetOptions{})
+		context.Background(), clusterObjectSyncName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("expected shared clusterObjectSync to be persisted without a local node session: %v", err)
 	}
@@ -564,7 +565,7 @@ func TestEnqueueNamespacedResourceBackfillsMissingObjectSyncSpec(t *testing.T) {
 	assertBackfillActions(t, client.Actions())
 
 	got, err := client.ReliablesyncsV1alpha1().ObjectSyncs(tf.TestNamespace).
-		Get(t.Context(), objectSync.Name, metav1.GetOptions{})
+		Get(context.Background(), objectSync.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to get objectSync: %v", err)
 	}
@@ -581,7 +582,7 @@ func TestEnqueueNonNamespacedResourceBackfillsMissingClusterObjectSyncSpec(t *te
 	assertBackfillActions(t, client.Actions())
 
 	got, err := client.ReliablesyncsV1alpha1().ClusterObjectSyncs().
-		Get(t.Context(), clusterObjectSync.Name, metav1.GetOptions{})
+		Get(context.Background(), clusterObjectSync.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to get clusterObjectSync: %v", err)
 	}
