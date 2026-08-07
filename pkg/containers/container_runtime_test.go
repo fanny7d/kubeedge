@@ -48,12 +48,19 @@ func TestCopyResources(t *testing.T) {
 			image:        "kubeedge/pause:3.1",
 			files:        map[string]string{"/tmp/src": "/usr/local/bin/dest"},
 			setupMock: func(t *testing.T, m *mock.MockRuntimeService) {
-				var logDirectory string
+				var logDirectory, expectedCommand string
 				m.EXPECT().RunPodSandbox(gomock.Any(), gomock.Any(), gomock.Any()).
 					Do(func(_ context.Context, config *runtimeapi.PodSandboxConfig, _ string) {
 						logDirectory = config.LogDirectory
 						if !filepath.IsAbs(logDirectory) {
 							t.Errorf("LogDirectory must be absolute, got %q", logDirectory)
+						}
+						var err error
+						expectedCommand, _, err = copyResourcesCmd(
+							map[string]string{"/tmp/src": "/usr/local/bin/dest"}, config.Metadata.Uid,
+						)
+						if err != nil {
+							t.Fatalf("build expected command: %v", err)
 						}
 					}).Return("sb-123", nil)
 				m.EXPECT().CreateContainer(gomock.Any(), "sb-123", gomock.Any(), gomock.Any()).
@@ -64,13 +71,21 @@ func TestCopyResources(t *testing.T) {
 						if sandboxConfig.LogDirectory != logDirectory {
 							t.Errorf("sandbox LogDirectory changed: got %q, want %q", sandboxConfig.LogDirectory, logDirectory)
 						}
+						var foundStateMount bool
+						for _, mount := range config.Mounts {
+							if mount.HostPath == logDirectory && mount.ContainerPath == copyResourcesStateMount {
+								foundStateMount = true
+							}
+						}
+						if !foundStateMount {
+							t.Errorf("copy completion state mount was not configured")
+						}
 					}).Return("cnt-123", nil)
 				m.EXPECT().StartContainer(gomock.Any(), "cnt-123").Return(nil)
 				m.EXPECT().ExecSync(gomock.Any(), "cnt-123", gomock.Any(), gomock.Any()).
 					Do(func(_ context.Context, _ string, cmd []string, _ time.Duration) {
-						expected := "cp /tmp/src /tmp/usr/local/bin/dest"
-						if cmd[2] != expected {
-							t.Errorf("expected command %s, got %s", expected, cmd[2])
+						if cmd[2] != expectedCommand {
+							t.Errorf("expected command %s, got %s", expectedCommand, cmd[2])
 						}
 					}).Return([]byte("stdout"), []byte(""), nil)
 				m.EXPECT().StopContainer(gomock.Any(), "cnt-123", copyResourcesStopTimeout).Return(nil)
@@ -116,6 +131,46 @@ func TestCopyResources(t *testing.T) {
 				m.EXPECT().StartContainer(gomock.Any(), "cnt-fail").Return(fmt.Errorf("internal error"))
 				m.EXPECT().RemoveContainer(gomock.Any(), "cnt-fail").Return(nil)
 				m.EXPECT().RemovePodSandbox(gomock.Any(), "sb-fail").Return(nil)
+			},
+		},
+		{
+			name:    "Success: orphan sandbox exits after commit marker",
+			image:   "kubeedge/pause:3.1",
+			files:   map[string]string{"/src": "/dest"},
+			wantErr: false,
+			setupMock: func(t *testing.T, m *mock.MockRuntimeService) {
+				var logDirectory string
+				m.EXPECT().RunPodSandbox(gomock.Any(), gomock.Any(), gomock.Any()).
+					Do(func(_ context.Context, config *runtimeapi.PodSandboxConfig, _ string) {
+						logDirectory = config.LogDirectory
+					}).Return("sb-orphan", nil)
+				m.EXPECT().CreateContainer(gomock.Any(), "sb-orphan", gomock.Any(), gomock.Any()).Return("cnt-orphan", nil)
+				m.EXPECT().StartContainer(gomock.Any(), "cnt-orphan").Return(nil)
+				m.EXPECT().ExecSync(gomock.Any(), "cnt-orphan", gomock.Any(), gomock.Any()).
+					Do(func(_ context.Context, _ string, _ []string, _ time.Duration) {
+						if err := os.WriteFile(filepath.Join(logDirectory, copyResourcesCompleteFile), nil, 0600); err != nil {
+							t.Fatalf("write completion marker: %v", err)
+						}
+					}).Return(nil, nil, fmt.Errorf("process exited with 137"))
+				m.EXPECT().StopContainer(gomock.Any(), "cnt-orphan", copyResourcesStopTimeout).Return(nil)
+				m.EXPECT().RemoveContainer(gomock.Any(), "cnt-orphan").Return(nil)
+				m.EXPECT().RemovePodSandbox(gomock.Any(), "sb-orphan").Return(nil)
+			},
+		},
+		{
+			name:    "Failure: copy command exits before commit marker",
+			image:   "kubeedge/pause:3.1",
+			files:   map[string]string{"/src": "/dest"},
+			wantErr: true,
+			setupMock: func(t *testing.T, m *mock.MockRuntimeService) {
+				m.EXPECT().RunPodSandbox(gomock.Any(), gomock.Any(), gomock.Any()).Return("sb-copy-fail", nil)
+				m.EXPECT().CreateContainer(gomock.Any(), "sb-copy-fail", gomock.Any(), gomock.Any()).Return("cnt-copy-fail", nil)
+				m.EXPECT().StartContainer(gomock.Any(), "cnt-copy-fail").Return(nil)
+				m.EXPECT().ExecSync(gomock.Any(), "cnt-copy-fail", gomock.Any(), gomock.Any()).
+					Return(nil, []byte("copy failed"), fmt.Errorf("process exited with 1"))
+				m.EXPECT().StopContainer(gomock.Any(), "cnt-copy-fail", copyResourcesStopTimeout).Return(nil)
+				m.EXPECT().RemoveContainer(gomock.Any(), "cnt-copy-fail").Return(nil)
+				m.EXPECT().RemovePodSandbox(gomock.Any(), "sb-copy-fail").Return(nil)
 			},
 		},
 		{
@@ -192,17 +247,21 @@ func TestCopyResourcesCleanupUsesIndependentContext(t *testing.T) {
 	}
 }
 
-func Test_copyResourcesCmd(t *testing.T) {
+func TestCopyResourcesCmd(t *testing.T) {
 	tests := []struct {
 		name  string
 		files map[string]string
-		check func(string) bool
+		check func(string, []string, error) bool
 	}{
 		{
 			name:  "Single file command",
 			files: map[string]string{"/image/path": "/host/path"},
-			check: func(res string) bool {
-				return res == "cp /image/path /tmp/host/path"
+			check: func(res string, tempFiles []string, err error) bool {
+				return err == nil &&
+					res == "cp '/image/path' '/tmp/host/path.kubeedge-copy-test' && "+
+						"mv -f '/tmp/host/path.kubeedge-copy-test' '/tmp/host/path' && "+
+						": > '/tmp/kubeedge-copy-state/complete'" &&
+					len(tempFiles) == 1 && tempFiles[0] == "/host/path.kubeedge-copy-test"
 			},
 		},
 		{
@@ -211,18 +270,29 @@ func Test_copyResourcesCmd(t *testing.T) {
 				"/src1": "/dest1",
 				"/src2": "/dest2",
 			},
-			check: func(res string) bool {
-				return strings.Contains(res, "cp /src1 /tmp/dest1") &&
-					strings.Contains(res, "cp /src2 /tmp/dest2") &&
-					strings.Contains(res, " && ")
+			check: func(res string, tempFiles []string, err error) bool {
+				return err == nil &&
+					strings.Contains(res, "cp '/src1' '/tmp/dest1.kubeedge-copy-test'") &&
+					strings.Contains(res, "cp '/src2' '/tmp/dest2.kubeedge-copy-test'") &&
+					strings.Contains(res, "mv -f '/tmp/dest1.kubeedge-copy-test' '/tmp/dest1'") &&
+					strings.Contains(res, "mv -f '/tmp/dest2.kubeedge-copy-test' '/tmp/dest2'") &&
+					len(tempFiles) == 2
+			},
+		},
+		{
+			name:  "Reject relative paths",
+			files: map[string]string{"relative": "/host/path"},
+			check: func(_ string, _ []string, err error) bool {
+				return err != nil
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := copyResourcesCmd(tt.files)
-			if !tt.check(got) {
-				t.Errorf("copyResourcesCmd() = %v, check failed", got)
+			got, tempFiles, err := copyResourcesCmd(tt.files, "test")
+			if !tt.check(got, tempFiles, err) {
+				t.Errorf("copyResourcesCmd() = %q, tempFiles = %v, err = %v; check failed",
+					got, tempFiles, err)
 			}
 		})
 	}

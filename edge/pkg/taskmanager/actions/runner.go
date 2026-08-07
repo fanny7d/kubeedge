@@ -142,16 +142,22 @@ func (r *ActionRunner) RunAction(ctx context.Context, jobname, nodename, action 
 		if err := r.PreRun(ctx, jobname, nodename, action, ser); err != nil {
 			logger.Error(err, "failed to run pre-run hook, report to cloud")
 			r.ReportActionStatus(jobname, nodename, action, &baseActionResponse{err: err})
+			if r.PostRun != nil {
+				if postErr := r.PostRun(ctx, jobname, nodename, action, ser); postErr != nil {
+					logger.Error(postErr, "failed to run post-run hook")
+				}
+			}
 			return
 		}
 	}
+	paused := false
 	for {
 		logger.V(1).Info("run action", "action", act.Name)
 		actionFn, err := r.mustGetAction(act.Name)
 		if err != nil {
 			logger.Error(err, "failed to get action handler, report to cloud")
-			r.ReportActionStatus(act.Name, jobname, nodename, &baseActionResponse{err: err})
-			return
+			r.ReportActionStatus(jobname, nodename, act.Name, &baseActionResponse{err: err})
+			break
 		}
 		resp := actionFn(ctx, jobname, nodename, ser)
 		r.ReportActionStatus(jobname, nodename, act.Name, resp)
@@ -166,6 +172,10 @@ func (r *ActionRunner) RunAction(ctx context.Context, jobname, nodename, action 
 		}
 		if resp.NeedInterrupt() {
 			logger.V(1).Info("action needs to be interrupted", "action", act.Name)
+			// A successful interruption is the confirmation gate and must retain
+			// its saved task. An interrupted failure is terminal and must be
+			// cleaned up so a later confirmation cannot resume a rejected task.
+			paused = resp.Error() == nil
 			break
 		}
 		next := act.NextSuccessful
@@ -175,9 +185,9 @@ func (r *ActionRunner) RunAction(ctx context.Context, jobname, nodename, action 
 		}
 		act = next
 	}
-	if act.NextSuccessful == nil && r.PostRun != nil {
+	if !paused && r.PostRun != nil {
 		if err := r.PostRun(ctx, jobname, nodename, action, ser); err != nil {
-			logger.Error(err, "failed to run pre-run hook, report to cloud")
+			logger.Error(err, "failed to run post-run hook")
 		}
 	}
 }

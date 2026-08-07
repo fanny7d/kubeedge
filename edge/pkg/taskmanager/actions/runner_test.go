@@ -30,6 +30,26 @@ type fakeFuncs struct {
 	stepcount    int
 	triggerError bool
 	step3ToFail  bool
+	preRunCount  int
+	postRunCount int
+}
+
+func (fr *fakeFuncs) preRun(
+	_ctx context.Context,
+	_jobname, _nodename, _action string,
+	_specser SpecSerializer,
+) error {
+	fr.preRunCount++
+	return nil
+}
+
+func (fr *fakeFuncs) postRun(
+	_ctx context.Context,
+	_jobname, _nodename, _action string,
+	_specser SpecSerializer,
+) error {
+	fr.postRunCount++
+	return nil
 }
 
 func (fr *fakeFuncs) step1(
@@ -136,6 +156,8 @@ func newFakeRunner() (*ActionRunner, *fakeFuncs) {
 		},
 		ReportActionStatus: funcs.reportActionStatus,
 		GetSpecSerializer:  funcs.getSpecSerializer,
+		PreRun:             funcs.preRun,
+		PostRun:            funcs.postRun,
 	}
 	return runner, funcs
 }
@@ -149,17 +171,27 @@ func TestRunAction(t *testing.T) {
 	r.RunAction(ctx, jobname, nodename, "step1", nil)
 	assert.Equal(t, 2, funcs.stepcount)
 	assert.False(t, funcs.triggerError)
+	assert.Equal(t, 1, funcs.preRunCount)
+	assert.Zero(t, funcs.postRunCount)
 
 	// step3 -- [error] --> step3fail
 	funcs.stepcount = 0
+	funcs.preRunCount = 0
+	funcs.postRunCount = 0
 	funcs.step3ToFail = true
 	r.RunAction(ctx, jobname, nodename, "step3", nil)
 	assert.Equal(t, 2, funcs.stepcount)
 	assert.True(t, funcs.triggerError)
+	assert.Equal(t, 1, funcs.preRunCount)
+	assert.Equal(t, 1, funcs.postRunCount)
 
 	// step4 -- [error] -- x
 	funcs.stepcount = 0
+	funcs.preRunCount = 0
+	funcs.postRunCount = 0
 	r.RunAction(ctx, jobname, nodename, "step4", nil)
 	assert.Equal(t, 1, funcs.stepcount)
 	assert.True(t, funcs.triggerError)
+	assert.Equal(t, 1, funcs.preRunCount)
+	assert.Equal(t, 1, funcs.postRunCount)
 }

@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -43,6 +45,9 @@ const (
 	copyResourcesCleanupTimeout = 45 * time.Second
 	copyResourcesStopTimeout    = int64(5)
 	copyResourcesContainerName  = "container"
+	copyResourcesStateMount     = "/tmp/kubeedge-copy-state"
+	copyResourcesCompleteFile   = "complete"
+	copyResourcesTempPrefix     = ".kubeedge-copy-"
 )
 
 type ContainerRuntime interface {
@@ -97,11 +102,21 @@ func (runtime *ContainerRuntimeImpl) CopyResources(
 	if err := os.MkdirAll(filepath.Join(logDirectory, copyResourcesContainerName), 0755); err != nil {
 		return fmt.Errorf("create resource copy log directory: %w", err)
 	}
+	copyCmd, tempFiles, err := copyResourcesCmd(files, sandboxUID)
+	if err != nil {
+		if removeErr := os.RemoveAll(logDirectory); removeErr != nil {
+			return errors.Join(err, fmt.Errorf("remove resource copy log directory %q: %w", logDirectory, removeErr))
+		}
+		return err
+	}
+	completeFile := filepath.Join(logDirectory, copyResourcesCompleteFile)
 
 	var sandbox, containerID string
 	containerStarted := false
 	defer func() {
-		cleanupErr := runtime.cleanupCopyResources(ctx, sandbox, containerID, containerStarted, logDirectory)
+		cleanupErr := runtime.cleanupCopyResources(
+			ctx, sandbox, containerID, containerStarted, logDirectory, tempFiles,
+		)
 		if cleanupErr != nil {
 			if retErr != nil {
 				retErr = errors.Join(retErr, cleanupErr)
@@ -133,7 +148,6 @@ func (runtime *ContainerRuntimeImpl) CopyResources(
 		cgroupName := cm.NewCgroupName(cm.CgroupName{"kubeedge", "setup", "podcopyresource"})
 		psc.Linux.CgroupParent = cgroupName.ToSystemd()
 	}
-	var err error
 	sandbox, err = runtime.ctrsvc.RunPodSandbox(ctx, psc, "")
 	if err != nil {
 		return err
@@ -146,6 +160,10 @@ func (runtime *ContainerRuntimeImpl) CopyResources(
 			ContainerPath: filepath.Join("/tmp", filepath.Dir(hostPath)),
 		})
 	}
+	mounts = append(mounts, &runtimeapi.Mount{
+		HostPath:      logDirectory,
+		ContainerPath: copyResourcesStateMount,
+	})
 	containerConfig := &runtimeapi.ContainerConfig{
 		Metadata: &runtimeapi.ContainerMetadata{
 			Name: copyResourcesContainerName,
@@ -180,9 +198,17 @@ func (runtime *ContainerRuntimeImpl) CopyResources(
 	}
 	containerStarted = true
 
-	cmd := []string{"/bin/sh", "-c", copyResourcesCmd(files)}
+	cmd := []string{"/bin/sh", "-c", copyCmd}
 	stdout, stderr, err := runtime.ctrsvc.ExecSync(ctx, containerID, cmd, 30*time.Second)
 	if err != nil {
+		// Edged can reap the directly-created CRI sandbox as an orphan after
+		// the atomic file replacement has already completed. In that case CRI
+		// reports exit 137 even though the copy is durable. The marker is written
+		// last, so it is safe to accept only this completed state.
+		if _, statErr := os.Stat(completeFile); statErr == nil {
+			klog.Warningf("resource copy command ended after files were committed: %v", err)
+			return nil
+		}
 		return fmt.Errorf("failed to exec copy cmd, err: %v, stderr: %s, stdout: %s", err, string(stderr), string(stdout))
 	}
 
@@ -194,6 +220,7 @@ func (runtime *ContainerRuntimeImpl) cleanupCopyResources(
 	sandboxID, containerID string,
 	containerStarted bool,
 	logDirectory string,
+	tempFiles []string,
 ) error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), copyResourcesCleanupTimeout)
 	defer cancel()
@@ -214,6 +241,11 @@ func (runtime *ContainerRuntimeImpl) cleanupCopyResources(
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("remove resource copy sandbox %q: %w", sandboxID, err))
 		}
 	}
+	for _, tempFile := range tempFiles {
+		if err := os.Remove(tempFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("remove staged resource %q: %w", tempFile, err))
+		}
+	}
 	if err := os.RemoveAll(logDirectory); err != nil {
 		cleanupErrors = append(cleanupErrors, fmt.Errorf("remove resource copy log directory %q: %w", logDirectory, err))
 	}
@@ -221,16 +253,37 @@ func (runtime *ContainerRuntimeImpl) cleanupCopyResources(
 	return errors.Join(cleanupErrors...)
 }
 
-func copyResourcesCmd(files map[string]string) string {
-	var copyCmd string
-	first := true
-	for containerPath, hostPath := range files {
-		if first {
-			copyCmd = copyCmd + fmt.Sprintf("cp %s %s", containerPath, filepath.Join("/tmp", hostPath))
-			first = false
-		} else {
-			copyCmd = copyCmd + fmt.Sprintf(" && cp %s %s", containerPath, filepath.Join("/tmp", hostPath))
-		}
+func copyResourcesCmd(files map[string]string, copyID string) (string, []string, error) {
+	containerPaths := make([]string, 0, len(files))
+	for containerPath := range files {
+		containerPaths = append(containerPaths, containerPath)
 	}
-	return copyCmd
+	sort.Strings(containerPaths)
+
+	tempSuffix := copyResourcesTempPrefix + copyID
+	stageCommands := make([]string, 0, len(files))
+	commitCommands := make([]string, 0, len(files))
+	tempFiles := make([]string, 0, len(files))
+	for _, containerPath := range containerPaths {
+		hostPath := files[containerPath]
+		if !filepath.IsAbs(containerPath) || !filepath.IsAbs(hostPath) {
+			return "", nil, fmt.Errorf("resource copy paths must be absolute: source %q, destination %q",
+				containerPath, hostPath)
+		}
+		mountedHostPath := filepath.Join("/tmp", hostPath)
+		tempContainerPath := mountedHostPath + tempSuffix
+		tempFiles = append(tempFiles, hostPath+tempSuffix)
+		stageCommands = append(stageCommands, fmt.Sprintf("cp %s %s",
+			shellQuote(containerPath), shellQuote(tempContainerPath)))
+		commitCommands = append(commitCommands, fmt.Sprintf("mv -f %s %s",
+			shellQuote(tempContainerPath), shellQuote(mountedHostPath)))
+	}
+	commands := append(stageCommands, commitCommands...)
+	commands = append(commands, fmt.Sprintf(": > %s",
+		shellQuote(filepath.Join(copyResourcesStateMount, copyResourcesCompleteFile))))
+	return strings.Join(commands, " && "), tempFiles, nil
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
