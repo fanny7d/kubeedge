@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
@@ -287,6 +288,32 @@ func TestNodeUpgradeJobUpgrade(t *testing.T) {
 			"--toVersion", "v1.21.0",
 			"--image", "custom.com/kubeedge/installation-package",
 		}, args)
+	})
+
+	t.Run("verified image digest is forwarded to keadm", func(t *testing.T) {
+		spec := &operationsv1alpha2.NodeUpgradeJobSpec{
+			Version: "v1.21.0",
+			Image:   "custom.com/kubeedge/installation-package",
+			ImageDigestGetter: &operationsv1alpha2.ImageDigestGetter{
+				ARM64: "sha256:arm64",
+				AMD64: "sha256:amd64",
+			},
+		}
+
+		args := buildNodeUpgradeJobCommandArgs(spec)
+		want := []string{
+			"upgrade", "edge",
+			"--force",
+			"--toVersion", "v1.21.0",
+			"--image", "custom.com/kubeedge/installation-package",
+		}
+		switch runtime.GOARCH {
+		case "arm64":
+			want = append(want, "--image-digest", "sha256:arm64")
+		case "amd64":
+			want = append(want, "--image-digest", "sha256:amd64")
+		}
+		assert.Equal(t, want, args)
 	})
 
 	t.Run("malicious fields are kept as argv values", func(t *testing.T) {

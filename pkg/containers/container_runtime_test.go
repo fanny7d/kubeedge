@@ -28,8 +28,11 @@ import (
 
 	"github.com/golang/mock/gomock"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	kubelettypes "k8s.io/kubelet/pkg/types"
 
+	apiconsts "github.com/kubeedge/api/apis/common/constants"
 	"github.com/kubeedge/api/apis/componentconfig/edgecore/v1alpha2"
+	"github.com/kubeedge/kubeedge/common/constants"
 	mock "github.com/kubeedge/kubeedge/pkg/containers/testing"
 )
 
@@ -70,6 +73,17 @@ func TestCopyResources(t *testing.T) {
 						}
 						if sandboxConfig.LogDirectory != logDirectory {
 							t.Errorf("sandbox LogDirectory changed: got %q, want %q", sandboxConfig.LogDirectory, logDirectory)
+						}
+						wantLabels := map[string]string{
+							kubelettypes.KubernetesPodNameLabel:       apiconsts.KubeEdgeBinaryName,
+							kubelettypes.KubernetesPodNamespaceLabel:  constants.SystemNamespace,
+							kubelettypes.KubernetesPodUIDLabel:        sandboxConfig.Metadata.Uid,
+							kubelettypes.KubernetesContainerNameLabel: copyResourcesContainerName,
+						}
+						for key, want := range wantLabels {
+							if got := config.Labels[key]; got != want {
+								t.Errorf("container label %q = %q, want %q", key, got, want)
+							}
 						}
 						var foundStateMount bool
 						for _, mount := range config.Mounts {

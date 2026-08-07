@@ -286,6 +286,20 @@ func buildNodeUpgradeJobCommandArgs(spec *operationsv1alpha2.NodeUpgradeJobSpec)
 	if spec.Image != "" {
 		args = append(args, "--image", spec.Image)
 	}
+	if getter := spec.ImageDigestGetter; getter != nil {
+		var digest string
+		switch runtime.GOARCH {
+		case "arm64":
+			digest = getter.ARM64
+		case "amd64":
+			digest = getter.AMD64
+		}
+		if digest != "" {
+			// Check verifies the image before backup. Pass the same immutable
+			// digest to keadm so the later pull cannot silently resolve a moved tag.
+			args = append(args, "--image-digest", digest)
+		}
+	}
 	return args
 }
 

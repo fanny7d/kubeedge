@@ -42,11 +42,9 @@ func TestReportUpgradeStatus(t *testing.T) {
 
 	globpatches := gomonkey.NewPatches()
 	defer globpatches.Reset()
-
 	globpatches.ApplyFunc(upgradeedge.JSONReporterInfoExists, func() bool {
 		return true
 	})
-
 	globpatches.ApplyFunc(upgradeedge.RemoveJSONReporterInfo, func() error {
 		return nil
 	})
@@ -75,22 +73,6 @@ func TestReportUpgradeStatus(t *testing.T) {
 		err := ReportUpgradeStatus(ctx)
 		require.NoError(t, err)
 		assert.False(t, parseReporterInfoCalled)
-	})
-
-	t.Run("no upgrade record found", func(t *testing.T) {
-		patches := gomonkey.NewPatches()
-		defer patches.Reset()
-
-		patches.ApplyFunc(upgradeedge.ParseJSONReporterInfo, func() (upgradeedge.JSONReporterInfo, error) {
-			return upgradeedge.JSONReporterInfo{}, nil
-		})
-		patches.ApplyMethodFunc(reflect.TypeOf((*dbclient.Upgrade)(nil)), "Get",
-			func() (string, string, *operationsv1alpha2.NodeUpgradeJobSpec, error) {
-				return "", "", nil, nil
-			})
-
-		err := ReportUpgradeStatus(ctx)
-		require.ErrorContains(t, err, "no upgrade record found or invalid info from meta data")
 	})
 
 	t.Run("unsupportd event type", func(t *testing.T) {
@@ -193,4 +175,32 @@ func TestReportUpgradeStatus(t *testing.T) {
 		assert.True(t, reportStatusCalled)
 		assert.False(t, runActionCalled)
 	})
+}
+
+func TestReportUpgradeStatusWithoutTaskRecord(t *testing.T) {
+	var removeReporterInfoCalled bool
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	patches.ApplyFunc(upgradeedge.JSONReporterInfoExists, func() bool {
+		return true
+	})
+	patches.ApplyFunc(upgradeedge.ParseJSONReporterInfo, func() (upgradeedge.JSONReporterInfo, error) {
+		return upgradeedge.JSONReporterInfo{
+			EventType: upgradeedge.EventTypeUpgrade,
+			Success:   true,
+		}, nil
+	})
+	patches.ApplyMethodFunc(reflect.TypeOf((*dbclient.Upgrade)(nil)), "Get",
+		func() (string, string, *operationsv1alpha2.NodeUpgradeJobSpec, error) {
+			return "", "", nil, nil
+		})
+	patches.ApplyFunc(upgradeedge.RemoveJSONReporterInfo, func() error {
+		removeReporterInfoCalled = true
+		return nil
+	})
+
+	err := ReportUpgradeStatus(context.Background())
+	require.NoError(t, err)
+	assert.True(t, removeReporterInfoCalled)
 }

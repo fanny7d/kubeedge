@@ -32,6 +32,7 @@ import (
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	remote "k8s.io/cri-client/pkg"
 	"k8s.io/klog/v2"
+	kubelettypes "k8s.io/kubelet/pkg/types"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
 
 	apiconsts "github.com/kubeedge/api/apis/common/constants"
@@ -179,6 +180,16 @@ func (runtime *ContainerRuntimeImpl) CopyResources(
 	containerConfig := &runtimeapi.ContainerConfig{
 		Metadata: &runtimeapi.ContainerMetadata{
 			Name: copyResourcesContainerName,
+		},
+		// Kubelet groups CRI containers into runtime pods from these labels. A
+		// directly-created container without them becomes a second runtime pod
+		// with an empty UID, bypassing the guarded sandbox and getting reaped as
+		// an orphan while the copy is still in progress.
+		Labels: map[string]string{
+			kubelettypes.KubernetesPodNameLabel:       apiconsts.KubeEdgeBinaryName,
+			kubelettypes.KubernetesPodNamespaceLabel:  constants.SystemNamespace,
+			kubelettypes.KubernetesPodUIDLabel:        sandboxUID,
+			kubelettypes.KubernetesContainerNameLabel: copyResourcesContainerName,
 		},
 		Image: &runtimeapi.ImageSpec{
 			Image: image,

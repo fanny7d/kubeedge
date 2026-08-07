@@ -19,7 +19,6 @@ package taskmanager
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -52,7 +51,16 @@ func ReportUpgradeStatus(ctx context.Context) error {
 		return fmt.Errorf("failed to get upgrade record, err: %v", err)
 	}
 	if jobname == "" || nodename == "" {
-		return errors.New("no upgrade record found or invalid info from meta data")
+		// Standalone keadm backup/upgrade/rollback commands also write the JSON
+		// reporter file, but intentionally have no NodeUpgradeJob record. Treat
+		// that as a completed local operation instead of reporting an error on
+		// every later cloud reconnect.
+		logger.V(1).Info("standalone upgrade report has no node task record, remove it",
+			"eventType", info.EventType)
+		if err := upgradeedge.RemoveJSONReporterInfo(); err != nil {
+			return fmt.Errorf("failed to remove standalone upgrade report, err: %v", err)
+		}
+		return nil
 	}
 
 	var action string
