@@ -35,6 +35,7 @@ type statusManager struct {
 	mtx              sync.Mutex
 	mgr              manager.Manager
 	client           client.Client
+	waitForCacheSync func(context.Context) bool
 	serializer       runtime.Serializer
 	watching         map[schema.GroupVersionKind]context.CancelFunc
 	watchCh          chan schema.GroupVersionKind
@@ -45,14 +46,15 @@ type statusManager struct {
 
 func NewStatusManager(ctx context.Context, mgr manager.Manager, client client.Client, serializer runtime.Serializer) StatusManager {
 	return &statusManager{
-		ctx:        ctx,
-		mtx:        sync.Mutex{},
-		mgr:        mgr,
-		client:     client,
-		serializer: serializer,
-		watching:   make(map[schema.GroupVersionKind]context.CancelFunc),
-		watchCh:    make(chan schema.GroupVersionKind, 1024),
-		cancelCh:   make(chan schema.GroupVersionKind, 1024),
+		ctx:              ctx,
+		mtx:              sync.Mutex{},
+		mgr:              mgr,
+		client:           client,
+		waitForCacheSync: mgr.GetCache().WaitForCacheSync,
+		serializer:       serializer,
+		watching:         make(map[schema.GroupVersionKind]context.CancelFunc),
+		watchCh:          make(chan schema.GroupVersionKind, 1024),
+		cancelCh:         make(chan schema.GroupVersionKind, 1024),
 	}
 }
 
@@ -92,8 +94,21 @@ func (s *statusManager) Start() error {
 	go s.watchStatusWorker()
 	go s.cancelWatchWorker()
 	go s.waitForTerminatingWorkers()
-	go wait.Until(s.watchControllersGC, 5*time.Minute, s.ctx.Done())
+	go s.runWatchControllersGC()
 	return nil
+}
+
+func (s *statusManager) runWatchControllersGC() {
+	// The manager-owned client reads through the manager cache. Setup runs
+	// before manager.Start, so an immediate GC list would otherwise race the
+	// cache startup and emit a misleading startup error on every replica.
+	if !s.waitForCacheSync(s.ctx) {
+		if s.ctx.Err() == nil {
+			klog.Error("failed to sync controller-manager cache before starting status controller GC")
+		}
+		return
+	}
+	wait.Until(s.watchControllersGC, 5*time.Minute, s.ctx.Done())
 }
 
 func (s *statusManager) SetReconcileTriggerChan(ch chan event.GenericEvent) {

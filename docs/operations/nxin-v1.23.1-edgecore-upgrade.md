@@ -41,10 +41,13 @@ keadm 保留了历史 EdgeCore bootstrap、失败恢复和旧二进制重启逻�
 2. 从 CloudCore 日志定位所有持续上报已删除 Pod 的来源节点和精确 UID；确认目标
    节点已有健康替代 Pod，并取得每个受影响节点的明确授权。新 CloudCore 会主动
    删除这些本地旧 UID，仅有 ACK 操作授权并不等于边缘节点变更授权。
-3. 先安装 namespace-scoped Lease RBAC，再滚动两个
-   `kubeedge-controller-manager` 副本。要求 `maxUnavailable=0`、PDB
-   `minAvailable=1`、跨云主机分布、探针 Ready，且任意时刻只有
-   `kubeedge-controller-manager` Lease 的 holder 执行 reconcile。
+3. 先安装 namespace-scoped Lease/Event RBAC。首次从没有 leader election 的
+   `.5` 迁移时，必须先把旧 controller-manager 完全缩到 0，再启动 1 个 `.6`
+   副本并等待其取得 Lease，最后扩到 2 个；禁止 `.5` 与 `.6` 重叠运行，也避免
+   两个新副本首次同时创建 Lease 的竞争日志。后续已有 leader election 的版本才
+   使用 `maxUnavailable=0` 正常滚动。最终要求 PDB `minAvailable=1`、跨云主机
+   分布、探针 Ready，且任意时刻只有 `kubeedge-controller-manager` Lease 的
+   holder 执行 reconcile。
 4. controller-manager 主备切换通过后，再滚动 CloudCore。CloudCore 固定三副本、
    `maxUnavailable=1`、PDB `minAvailable=2`、跨云主机分布和
    `minReadySeconds>=10`；任何时刻至少两个 Ready，禁止重建或更换受保护的 NLB、

@@ -102,9 +102,14 @@ manager did not use leader election.
   `kubeedge-controller-manager`; the Pod namespace comes from the downward API
   and falls back to the KubeEdge system namespace outside Kubernetes.
 - The chart grants Lease access through a namespaced Role and RoleBinding,
+  grants the same identity permission to publish namespace-scoped leader
+  election Events,
   supports two controller-manager replicas, uses a zero-unavailable rolling
   strategy, exposes `/healthz` and `/readyz`, and spreads replicas across cloud
   hosts when capacity permits.
+- EdgeApplication status-controller garbage collection waits for the manager
+  cache to synchronize before its first List, avoiding a cache-not-started
+  error on every controller-manager startup.
 - Controller-manager and CloudCore PodDisruptionBudgets are configurable. The
   ACK HA values must use controller-manager `minAvailable=1` and CloudCore
   `minAvailable=2`.
@@ -131,7 +136,12 @@ manager did not use leader election.
    CloudCore PDB `minAvailable=2`, two controller-manager replicas,
    controller-manager PDB `minAvailable=1`, `maxUnavailable=0`, working health
    probes, and the namespace-scoped leader-election Role/RoleBinding.
-6. Roll controller-manager first. Verify both replicas are Ready on different
+6. When migrating from `.5`, install the Lease/Event RBAC, stop the singleton
+   `.5` controller completely, start one `.6` replica and wait for its Lease,
+   then scale `.6` to two replicas. This short controller-only gap prevents the
+   non-leader-elected `.5` process from reconciling concurrently and avoids a
+   first-create Lease race. For later leader-elected releases, use the normal
+   zero-unavailable rolling strategy. Verify both replicas are Ready on different
    cloud hosts, exactly one holder owns the `kubeedge-controller-manager`
    Lease, completed NodeUpgradeJobs remain unchanged, and leadership transfers
    without duplicate reconciliation when the leader is deliberately replaced.
