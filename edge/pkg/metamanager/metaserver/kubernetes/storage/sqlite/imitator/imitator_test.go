@@ -32,6 +32,7 @@ import (
 	"k8s.io/klog/v2"
 
 	edgecorev1alpha2 "github.com/kubeedge/api/apis/componentconfig/edgecore/v1alpha2"
+	policyv1alpha1 "github.com/kubeedge/api/apis/policy/v1alpha1"
 	"github.com/kubeedge/beehive/pkg/core/model"
 	cloudmodules "github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
 	edgemodules "github.com/kubeedge/kubeedge/edge/pkg/common/modules"
@@ -81,6 +82,41 @@ func TestEventSkipsEdgeOriginatedPodDeleteRequest(t *testing.T) {
 	assert.Empty(t, errorLogs.String())
 }
 
+func TestEventSkipsMessagesThatAreNotMetaServerWatchEvents(t *testing.T) {
+	state := klog.CaptureState()
+	t.Cleanup(state.Restore)
+	var errorLogs bytes.Buffer
+	klog.LogToStderr(false)
+	klog.SetOutputBySeverity("ERROR", &errorLogs)
+
+	tests := []struct {
+		name string
+		msg  *model.Message
+	}{
+		{
+			name: "edge-originated node request",
+			msg: model.NewMessage("").
+				BuildRouter(edgemodules.EdgedModuleName, "resource", "default/node/test-node", model.UpdateOperation).
+				FillBody(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}),
+		},
+		{
+			name: "service account access snapshot",
+			msg: model.NewMessage("").
+				BuildRouter(cloudmodules.PolicyControllerModuleName, "resource", "default/serviceaccountaccess/default", model.UpdateOperation).
+				FillBody(&policyv1alpha1.ServiceAccountAccess{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "default"}}),
+		},
+	}
+
+	client := newV2Client().(*imitator)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Empty(t, client.Event(tt.msg))
+		})
+	}
+	klog.Flush()
+	assert.Empty(t, errorLogs.String())
+}
+
 func TestEventAcceptsAuthoritativePodTombstone(t *testing.T) {
 	pod := &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{
@@ -105,6 +141,27 @@ func TestEventAcceptsAuthoritativePodTombstone(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, corev1.SchemeGroupVersion.WithKind("Pod"), deleted.GroupVersionKind())
 	assert.Equal(t, pod.UID, deleted.GetUID())
+}
+
+func TestEventAcceptsAuthoritativeCloudNode(t *testing.T) {
+	node := &corev1.Node{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: corev1.SchemeGroupVersion.String(),
+			Kind:       "Node",
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+	}
+	msg := model.NewMessage("").
+		BuildRouter(cloudmodules.EdgeControllerModuleName, "resource", "default/node/test-node", model.UpdateOperation).
+		FillBody(node)
+
+	client := newV2Client().(*imitator)
+	events := client.Event(msg)
+	require.Len(t, events, 1)
+	assert.Equal(t, watch.Modified, events[0].Type)
+	updated, ok := events[0].Object.(*unstructured.Unstructured)
+	require.True(t, ok)
+	assert.Equal(t, corev1.SchemeGroupVersion.WithKind("Node"), updated.GroupVersionKind())
 }
 
 func TestDeleteObjHonorsUID(t *testing.T) {

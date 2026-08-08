@@ -71,6 +71,22 @@ the Pod, container, token row, and cached metadata were removed successfully.
 - Repeated deletes and already-absent rows are treated as expected idempotent
   outcomes; database corruption and actual storage failures remain errors.
 
+## MetaServer non-watch message filtering
+
+MetaManager receives both authoritative resource events and edge-to-cloud
+requests on the same internal path. Edge-originated Node requests and
+PolicyController `ServiceAccountAccess` snapshots intentionally omit
+`apiVersion` and `kind`; neither is a MetaServer Kubernetes watch event.
+
+- Edge-originated Node requests continue to be stored in the legacy meta path
+  and forwarded to CloudCore, but are not injected into `meta_v2` as if the
+  edge's requested state were already authoritative.
+- `ServiceAccountAccess` continues to be stored in the legacy meta table used
+  by edge authorization, but is not injected into the unrelated MetaServer
+  watch cache.
+- Cloud-originated Node resources and all other authoritative events continue
+  through the normal MetaServer decode, persistence, and watch path.
+
 ## Required canary gates
 
 1. Pass the complete edgecontroller test package, focused MetaManager token
@@ -99,7 +115,11 @@ the Pod, container, token row, and cached metadata were removed successfully.
 9. Delete the token-refresh canary normally and verify that no `Kind is
    missing` error is emitted, the exact UID is removed from both metadata
    tables, and a simulated stale UID cannot delete a same-name replacement.
-10. Rebuild all formal cloud and edge artifacts from the final immutable `.6`
+10. Restart the edge canary and exercise a projected token request; verify that
+    edge-originated Node requests and `ServiceAccountAccess` snapshots produce
+    no `Kind is missing` records while their forwarding and authorization
+    behavior remains functional.
+11. Rebuild all formal cloud and edge artifacts from the final immutable `.6`
    tag; do not promote an RC digest or mix `.5` and `.6` source commits in the
    formal release set.
 

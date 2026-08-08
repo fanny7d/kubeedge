@@ -267,6 +267,21 @@ func (s *imitator) Event(msg *model.Message) []watch.Event {
 	klog.V(4).Infof("[metaserver] get a message from metamanager: %+v", msg)
 	var ret []watch.Event
 	_, resType, _ := parseResource(msg.Router.Resource)
+	// Edged Node messages are requests sent to the Kubernetes API, not
+	// authoritative watch events. The Node object produced by kubelet does not
+	// carry TypeMeta, and the accepted object is delivered from the cloud
+	// separately if MetaServer needs to observe it.
+	if resType == model.ResourceTypeNode && msg.GetSource() == modules.EdgedModuleName {
+		klog.V(4).Info("skip edge-originated node request")
+		return []watch.Event{}
+	}
+	// ServiceAccountAccess is an internal authorization snapshot consumed from
+	// MetaManager's legacy meta table. PolicyController intentionally sends it
+	// without TypeMeta, so it is not a Kubernetes watch event for MetaServer.
+	if resType == model.ResourceTypeSaAccess {
+		klog.V(4).Info("skip service account access snapshot")
+		return []watch.Event{}
+	}
 	// Edged sends Pod DeleteOptions to request deletion from the Kubernetes API.
 	// It is not an authoritative resource event and has no apiVersion or kind.
 	// The resulting cloud-side Pod deletion is delivered separately with the
