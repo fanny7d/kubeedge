@@ -121,6 +121,10 @@ func requireRemoteQuery(resType string) bool {
 		resType == model.ResourceTypeK8sCA
 }
 
+func isMetaManagerOnlyResource(resType string) bool {
+	return resType == model.ResourceTypeSaAccess
+}
+
 func msgDebugInfo(message *model.Message) string {
 	return fmt.Sprintf("msgID[%s] resource[%s]", message.GetID(), message.GetResource())
 }
@@ -194,7 +198,8 @@ func processDeletePodDB(message model.Message, ms *dbclient.MetaService) error {
 }
 
 func (m *metaManager) processInsert(message model.Message) {
-	if _, resType, _ := parseResource(&message); resType == model.ResourceTypeEvent {
+	_, resType, _ := parseResource(&message)
+	if resType == model.ResourceTypeEvent {
 		sendToCloud(&message)
 		return
 	}
@@ -217,7 +222,7 @@ func (m *metaManager) processInsert(message model.Message) {
 	if msgSource == cloudmodules.DeviceControllerModuleName {
 		message.SetRoute(modules.MetaGroup, modules.DeviceTwinModuleName)
 		beehiveContext.Send(modules.DeviceTwinModuleName, message)
-	} else if msgSource != cloudmodules.PolicyControllerModuleName {
+	} else if msgSource != cloudmodules.PolicyControllerModuleName && !isMetaManagerOnlyResource(resType) {
 		// Notify edged
 		sendToEdged(&message, false)
 	}
@@ -256,7 +261,7 @@ func (m *metaManager) processUpdate(message model.Message) {
 		resp := message.NewRespByMessage(&message, OK)
 		sendToEdged(resp, message.IsSync())
 	case cloudmodules.EdgeControllerModuleName, cloudmodules.DynamicControllerModuleName:
-		if resType != model.ResourceTypeNode {
+		if resType != model.ResourceTypeNode && !isMetaManagerOnlyResource(resType) {
 			sendToEdged(&message, message.IsSync())
 		}
 		resp := message.NewRespByMessage(&message, OK)
@@ -330,7 +335,7 @@ func (m *metaManager) processDelete(message model.Message) {
 		beehiveContext.Send(modules.DeviceTwinModuleName, message)
 	}
 
-	if msgSource != cloudmodules.PolicyControllerModuleName {
+	if msgSource != cloudmodules.PolicyControllerModuleName && !isMetaManagerOnlyResource(resType) {
 		// Notify edged
 		sendToEdged(&message, false)
 	}

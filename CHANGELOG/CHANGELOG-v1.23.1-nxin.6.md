@@ -84,6 +84,9 @@ PolicyController `ServiceAccountAccess` snapshots intentionally omit
 - `ServiceAccountAccess` continues to be stored in the legacy meta table used
   by edge authorization, but is not injected into the unrelated MetaServer
   watch cache.
+- `ServiceAccountAccess` insert, update, and delete messages are acknowledged
+  after MetaManager persistence but are not forwarded to Edged, whose resource
+  loop accepts only Pod and CSI Volume events.
 - Cloud-originated Node resources and all other authoritative events continue
   through the normal MetaServer decode, persistence, and watch path.
 

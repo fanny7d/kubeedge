@@ -22,6 +22,7 @@ import (
 	"github.com/kubeedge/beehive/pkg/common"
 	"github.com/kubeedge/beehive/pkg/core"
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
+	"github.com/kubeedge/beehive/pkg/core/model"
 	commodule "github.com/kubeedge/kubeedge/edge/pkg/common/modules"
 )
 
@@ -59,4 +60,24 @@ func TestNameAndGroup(t *testing.T) {
 			t.Errorf("Group of module is not correct wanted: %v and got: %v", commodule.MetaGroup, metaModule.Group())
 		}
 	})
+}
+
+func TestIsMetaManagerOnlyResource(t *testing.T) {
+	tests := []struct {
+		name     string
+		resType  string
+		expected bool
+	}{
+		{name: "service account access", resType: model.ResourceTypeSaAccess, expected: true},
+		{name: "pod", resType: model.ResourceTypePod, expected: false},
+		{name: "node", resType: model.ResourceTypeNode, expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isMetaManagerOnlyResource(tt.resType); got != tt.expected {
+				t.Fatalf("isMetaManagerOnlyResource(%q) = %t, want %t", tt.resType, got, tt.expected)
+			}
+		})
+	}
 }
