@@ -11,10 +11,14 @@ metadata:
   name: kubeedge-controller-manager
   namespace: {{ .Release.Namespace }}
 spec:
+  replicas: {{ .Values.controllerManager.replicaCount }}
   selector:
     {{- with .Values.controllerManager.labels }}
     matchLabels: {{- toYaml . | nindent 6 }}
     {{- end }}
+  {{- with .Values.controllerManager.strategy }}
+  strategy: {{ toYaml . | nindent 4 }}
+  {{- end }}
   template:
     metadata:
       {{- with .Values.controllerManager.labels }}
@@ -28,6 +32,33 @@ spec:
         - name: controller-manager
           image: {{ .Values.controllerManager.image.repository }}:{{ .Values.controllerManager.image.tag }}
           imagePullPolicy: {{ .Values.controllerManager.image.pullPolicy }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          {{- if .Values.controllerManager.healthProbes.enabled }}
+          ports:
+            - name: health
+              containerPort: {{ .Values.controllerManager.healthProbes.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: {{ .Values.controllerManager.healthProbes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.controllerManager.healthProbes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.controllerManager.healthProbes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.controllerManager.healthProbes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: {{ .Values.controllerManager.healthProbes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.controllerManager.healthProbes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.controllerManager.healthProbes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.controllerManager.healthProbes.readiness.failureThreshold }}
+          {{- end }}
           {{- with .Values.controllerManager.resources }}
           resources: {{ toYaml . | nindent 12 }}
           {{- end }}
@@ -38,5 +69,8 @@ spec:
       {{- end }}
       {{- with .Values.controllerManager.tolerations }}
       tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controllerManager.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
       {{- end }}
 {{- end }}

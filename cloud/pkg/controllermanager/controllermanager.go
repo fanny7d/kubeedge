@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -24,10 +25,16 @@ import (
 	"github.com/kubeedge/kubeedge/cloud/pkg/controllermanager/edgeapplication"
 	"github.com/kubeedge/kubeedge/cloud/pkg/controllermanager/nodegroup"
 	"github.com/kubeedge/kubeedge/cloud/pkg/controllermanager/nodetask"
+	"github.com/kubeedge/kubeedge/common/constants"
 	"github.com/kubeedge/kubeedge/pkg/features"
 )
 
 var kubeedgeScheme = runtime.NewScheme()
+
+const (
+	podNamespaceEnv                   = "POD_NAMESPACE"
+	controllerManagerLeaderElectionID = "kubeedge-controller-manager"
+)
 
 func init() {
 	utilruntime.Must(scheme.AddToScheme(kubeedgeScheme))
@@ -43,10 +50,7 @@ type Controller interface {
 func NewControllerManager(ctx context.Context, kubeCfg *rest.Config, healthProbe string,
 ) (manager.Manager, error) {
 	const nothingCheckName = "nothing"
-	mgr, err := controllerruntime.NewManager(kubeCfg, controllerruntime.Options{
-		Scheme:                 kubeedgeScheme,
-		HealthProbeBindAddress: healthProbe,
-	})
+	mgr, err := controllerruntime.NewManager(kubeCfg, newControllerManagerOptions(healthProbe))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create controller manager, err: %v", err)
 	}
@@ -71,6 +75,24 @@ func NewControllerManager(ctx context.Context, kubeCfg *rest.Config, healthProbe
 		return nil, err
 	}
 	return mgr, nil
+}
+
+func controllerManagerLeaderElectionNamespace() string {
+	if namespace := os.Getenv(podNamespaceEnv); namespace != "" {
+		return namespace
+	}
+	return constants.SystemNamespace
+}
+
+func newControllerManagerOptions(healthProbe string) controllerruntime.Options {
+	return controllerruntime.Options{
+		Scheme:                        kubeedgeScheme,
+		HealthProbeBindAddress:        healthProbe,
+		LeaderElection:                true,
+		LeaderElectionID:              controllerManagerLeaderElectionID,
+		LeaderElectionNamespace:       controllerManagerLeaderElectionNamespace(),
+		LeaderElectionReleaseOnCancel: true,
+	}
 }
 
 func newAndStartCache(ctx context.Context, kubeCfg *rest.Config,

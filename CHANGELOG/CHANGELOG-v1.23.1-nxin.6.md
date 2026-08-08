@@ -90,39 +90,70 @@ PolicyController `ServiceAccountAccess` snapshots intentionally omit
 - Cloud-originated Node resources and all other authoritative events continue
   through the normal MetaServer decode, persistence, and watch path.
 
+## Cloud control-plane high availability
+
+The Helm release already ran three CloudCore replicas, but the separate
+`kubeedge-controller-manager` Deployment remained a single replica. Simply
+scaling the old binary would run multiple NodeUpgradeJob, NodeGroup, and
+EdgeApplication reconcilers concurrently because its controller-runtime
+manager did not use leader election.
+
+- `kubeedge-controller-manager` now uses a namespace-scoped Lease named
+  `kubeedge-controller-manager`; the Pod namespace comes from the downward API
+  and falls back to the KubeEdge system namespace outside Kubernetes.
+- The chart grants Lease access through a namespaced Role and RoleBinding,
+  supports two controller-manager replicas, uses a zero-unavailable rolling
+  strategy, exposes `/healthz` and `/readyz`, and spreads replicas across cloud
+  hosts when capacity permits.
+- Controller-manager and CloudCore PodDisruptionBudgets are configurable. The
+  ACK HA values must use controller-manager `minAvailable=1` and CloudCore
+  `minAvailable=2`.
+- CloudCore `minReadySeconds` is configurable so a newly started process must
+  remain available before the next old replica is removed.
+
 ## Required canary gates
 
 1. Pass the complete edgecontroller test package, focused MetaManager token
-   tests, repeated tests, and race tests for status-patch, Pod-status,
-   bound-token cleanup, and proactive token refresh paths.
-2. Build an immutable `.6-rc` CloudCore from a clean checkout and verify its
-   version, commit, clean-tree marker, Go version, platform, binary hash, and
-   OCI digest before deployment.
+   tests, controller-manager leader-election tests, repeated tests, and race
+   tests for status-patch, Pod-status, bound-token cleanup, and proactive token
+   refresh paths. Lint and render the HA Helm values and validate the rendered
+   resources with Kubernetes dry-run.
+2. Build immutable `.6-rc` CloudCore and controller-manager images from a clean
+   checkout and verify their version, commit, clean-tree marker, Go version,
+   platform, binary hashes, and OCI digests before deployment.
 3. Before the ACK canary, identify every stale Pod UID and verify that each
    affected node already has a healthy desired replacement for management,
    networking, MQTT, agent, and business workloads.
 4. Obtain explicit authorization for every affected edge node. Deploying the
    fixed CloudCore can immediately delete the identified stale UID from those
    nodes; ACK authorization alone does not authorize that edge mutation.
-5. Roll CloudCore with three replicas and `maxUnavailable=1`. Preserve the
+5. Before rolling either image, require three cross-host CloudCore replicas,
+   CloudCore PDB `minAvailable=2`, two controller-manager replicas,
+   controller-manager PDB `minAvailable=1`, `maxUnavailable=0`, working health
+   probes, and the namespace-scoped leader-election Role/RoleBinding.
+6. Roll controller-manager first. Verify both replicas are Ready on different
+   cloud hosts, exactly one holder owns the `kubeedge-controller-manager`
+   Lease, completed NodeUpgradeJobs remain unchanged, and leadership transfers
+   without duplicate reconciliation when the leader is deliberately replaced.
+7. Roll CloudCore with three replicas and `maxUnavailable=1`. Preserve the
    existing Service/NLB UID, ClusterIP, health-check port, NodePorts, external
    endpoints, and all active sessions.
-6. Verify that only the expected stale UIDs are deleted, replacement Pod and
+8. Verify that only the expected stale UIDs are deleted, replacement Pod and
    container IDs remain unchanged, management paths remain available, and no
    business workload restarts.
-7. After convergence, require a bounded steady-state window with no new E/F/W
+9. After convergence, require a bounded steady-state window with no new E/F/W
    records in CloudCore, controller-manager, or the authorized canary edge.
-8. Exercise at least one projected service account token refresh on the edge
+10. Exercise at least one projected service account token refresh on the edge
    canary. Verify that the expiration timestamp advances, the Pod and container
    IDs remain unchanged, and no `token expired` error is emitted.
-9. Delete the token-refresh canary normally and verify that no `Kind is
+11. Delete the token-refresh canary normally and verify that no `Kind is
    missing` error is emitted, the exact UID is removed from both metadata
    tables, and a simulated stale UID cannot delete a same-name replacement.
-10. Restart the edge canary and exercise a projected token request; verify that
+12. Restart the edge canary and exercise a projected token request; verify that
     edge-originated Node requests and `ServiceAccountAccess` snapshots produce
     no `Kind is missing` records while their forwarding and authorization
     behavior remains functional.
-11. Rebuild all formal cloud and edge artifacts from the final immutable `.6`
+13. Rebuild all formal cloud and edge artifacts from the final immutable `.6`
    tag; do not promote an RC digest or mix `.5` and `.6` source commits in the
    formal release set.
 
@@ -132,3 +163,8 @@ CloudCore can be rolled back to the digest-pinned `.5` image through the same
 protected three-replica strategy without replacing the Service or NLB. A stale
 Pod deletion is an intended convergence action and is not undone by rolling
 CloudCore back; verify healthy desired replacement Pods before canary approval.
+
+Do not run more than one `.5` controller-manager replica: that binary has no
+leader election. A controller-manager rollback must restore `replicas=1`
+before or atomically with the `.5` image, while preserving the current Lease,
+ServiceAccount, and RBAC for a later retry.

@@ -1,6 +1,6 @@
 # NXIN KubeEdge v1.23.1 云边升级方案
 
-本文用于把现网云侧和边缘节点统一升级到 `v1.23.1-nxin.5`。所有正式
+本文用于把现网云侧和边缘节点统一升级到 `v1.23.1-nxin.6`。所有正式
 制品必须来自上游 `v1.23.1` tag（commit
 `1a7ee88d3c61dc781cc9c9053066ab3d38519dd5`）派生的同一个 NXIN 不可变
 tag，禁止使用 `master` 或移动中的 release 分支构建。
@@ -23,27 +23,41 @@ tag，禁止使用 `master` 或移动中的 release 分支构建。
 
 | 当前 EdgeCore | 升级入口 | 原因 |
 | --- | --- | --- |
-| 已是正式 `.5` 且 hash 一致 | 不重复升级，只验收 | 避免无意义重启 |
-| `.4`、`.4-rc.1`、`.4-rc.2` 或已包含完整 copy labels 的版本 | 官方 NodeUpgradeJob，但必须先通过 watchdog 门禁 | 当前 EdgeCore 能安全完成 Check 的 CRI copy；`.4` 的启动竞态使其不能继续放量 |
-| `.3` 及更早 NXIN/上游版本 | 先带外分发正式 `.5` keadm，再执行摘要锁定的本地 bootstrap | 老 EdgeCore 的 Check 可能清理临时 copy sandbox，不能把首次升级完全交给 NodeUpgradeJob |
+| 已是正式 `.6` 且 hash 一致 | 不重复升级，只验收 | 避免无意义重启 |
+| `.4`、`.5`、对应 RC 或已包含完整 copy labels 的版本 | 官方 NodeUpgradeJob，但必须先通过 watchdog 门禁 | 当前 EdgeCore 能安全完成 Check 的 CRI copy；旧版本已知问题使其不能继续放量 |
+| `.3` 及更早 NXIN/上游版本 | 先带外分发正式 `.6` keadm，再执行摘要锁定的本地 bootstrap | 老 EdgeCore 的 Check 可能清理临时 copy sandbox，不能把首次升级完全交给 NodeUpgradeJob |
 | 版本、二进制 hash、数据库或管理链路不明 | 隔离并人工处理 | 不允许在未知状态下批量升级 |
 
 带外分发只替换 keadm，不停止 EdgeCore。必须通过 SSH、edge access agent 或其他
-独立管理链路传输，并在原子替换前验证 release manifest 中的 SHA256。正式 `.5`
+独立管理链路传输，并在原子替换前验证 release manifest 中的 SHA256。正式 `.6`
 keadm 保留了历史 EdgeCore bootstrap、失败恢复和旧二进制重启逻辑。
 
 ## 3. 升级顺序
 
 ### 3.1 云侧先行
 
-1. 备份当前 ACK deployment、service、NLB 标识、CRD 和 controller 配置。
-2. 先更新匹配 `.5` 的 CRD/controller-manager，再滚动 CloudCore。
-3. CloudCore 三副本逐个更新；任何时刻至少两个 Ready，禁止重建或更换受保护的
-   NLB、Service 地址和证书 Secret。
-4. 每个副本验证 image digest、版本、leader/session owner、Ready、restart count
+1. 备份当前 ACK Helm release、完整 values/manifest、Deployment、Service、NLB
+   UID/地址、NodePort、证书 Secret、CRD 和 controller 配置。
+2. 从 CloudCore 日志定位所有持续上报已删除 Pod 的来源节点和精确 UID；确认目标
+   节点已有健康替代 Pod，并取得每个受影响节点的明确授权。新 CloudCore 会主动
+   删除这些本地旧 UID，仅有 ACK 操作授权并不等于边缘节点变更授权。
+3. 先安装 namespace-scoped Lease RBAC，再滚动两个
+   `kubeedge-controller-manager` 副本。要求 `maxUnavailable=0`、PDB
+   `minAvailable=1`、跨云主机分布、探针 Ready，且任意时刻只有
+   `kubeedge-controller-manager` Lease 的 holder 执行 reconcile。
+4. controller-manager 主备切换通过后，再滚动 CloudCore。CloudCore 固定三副本、
+   `maxUnavailable=1`、PDB `minAvailable=2`、跨云主机分布和
+   `minReadySeconds>=10`；任何时刻至少两个 Ready，禁止重建或更换受保护的 NLB、
+   Service 地址和证书 Secret。
+5. 每个副本验证 image digest、版本、leader/session owner、Ready、restart count
    和错误日志后再继续。
-5. 云侧稳定后才创建边缘升级任务。云侧回滚与边侧回滚分别决策，不能因为单个
+6. 云侧稳定后才创建边缘升级任务。云侧回滚与边侧回滚分别决策，不能因为单个
    边缘节点失败就无条件整体回滚云侧。
+
+ACK 托管集群限制 `kubectl exec` 时，不把该限制判定为 CloudStream、CloudHub 或
+边缘网络故障，也不为此修改网络。云侧验收只使用 `kubectl get`、`kubectl logs`、
+Lease、Deployment/Pod/Service/NLB 状态及外部端点；需要读取边缘数据库、systemd
+和 CRI 时，只通过已明确授权节点的 SSH 管理通道。
 
 ### 3.2 边缘节点预检
 
@@ -87,7 +101,7 @@ systemd-run \
 以下变量必须来自正式 release manifest：
 
 ```bash
-TARGET_VERSION=v1.23.1-nxin.5
+TARGET_VERSION=v1.23.1-nxin.6
 INSTALL_IMAGE=nxin-acr-registry.cn-beijing.cr.aliyuncs.com/kubeedge/installation-package
 INSTALL_DIGEST=sha256:<arm64-verified-oci-index-digest>
 ```
@@ -117,9 +131,9 @@ INSTALL_DIGEST=sha256:<arm64-verified-oci-index-digest>
 apiVersion: operations.kubeedge.io/v1alpha2
 kind: NodeUpgradeJob
 metadata:
-  name: upgrade-<node>-v1231-nxin5
+  name: upgrade-<node>-v1231-nxin6
 spec:
-  version: v1.23.1-nxin.5
+  version: v1.23.1-nxin.6
   nodeNames:
     - <node>
   image: nxin-acr-registry.cn-beijing.cr.aliyuncs.com/kubeedge/installation-package
@@ -157,7 +171,12 @@ RBAC、复用 Pod token 或关闭 `requireAuthorization`。最终要求 `Check`�
 - EdgeCore `NRestarts=0`，containerd、agent、NPC 全程在线；
 - 数据库完整，无终态 upgrade task、upgrade report、copy guard 和临时容器残留；
 - 备份目录包含升级前 EdgeCore、配置和完整数据库；
-- 云侧 CloudCore/controller 副本、leader、session、Service/NLB 和错误日志稳定；
+- 云侧 CloudCore 为 3/3、controller-manager 为 2/2，Pod 跨主机，PDB、Lease、
+  session owner、Service/NLB 和错误日志稳定；controller-manager 始终只有一个
+  leader；
+- 投射 ServiceAccount token 在不重建 Pod/容器的情况下完成至少一次自动轮换，
+  expiration 前移，且无 `token expired` 错误；正常删除 canary 后，`meta` 与
+  `meta_v2` 中精确名称和 UID 都为 0；
 - 启动同步窗口结束后，连续至少 15 分钟统计 EdgeCore 与云侧 E/F/W 为 0。
 
 放量顺序固定为：1 个 canary、约 5%、约 20%、剩余节点。每批之间必须完成完整
@@ -173,6 +192,10 @@ RBAC、复用 Pod token 或关闭 `requireAuthorization`。最终要求 `Check`�
 
 回滚期间仍要保持 containerd 和独立管理通道在线。回滚后重复完整验收，并保留失败
 任务、journal 和 release manifest 作为证据。`.4` 边端包含已确认的启动竞态，
-不得在没有独立 watchdog guard 的情况下自动回滚到 `.4`。只有确认 `.5` 云侧与
-旧边侧不兼容或云侧自身不健康时，才按 ACK 的受保护滚动流程把
-CloudCore/controller 回滚到上一套同 tag 制品；不得删除或重建 NLB。
+不得在没有独立 watchdog guard 的情况下自动回滚到 `.4`。只有确认 `.6` 云侧与
+旧边侧不兼容或云侧自身不健康时，才按 ACK 的受保护滚动流程把 CloudCore 回滚到
+上一套同 tag 制品；不得删除或重建 NLB。
+
+`.5` controller-manager 没有 leader election，不能以两个副本运行。如果它也必须
+回滚，要先把副本数恢复为 1，或在同一次受保护 Helm rollback 中原子恢复单副本和
+`.5` 镜像；CloudCore 回滚并不要求一并回滚仍健康的 `.6` controller-manager。

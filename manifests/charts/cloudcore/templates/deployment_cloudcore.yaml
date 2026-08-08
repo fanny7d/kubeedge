@@ -10,6 +10,7 @@ metadata:
   name: cloudcore
 spec:
   replicas: {{ .Values.cloudCore.replicaCount }}
+  minReadySeconds: {{ .Values.cloudCore.minReadySeconds }}
   selector:
     {{- with .Values.cloudCore.labels }}
     matchLabels: {{- toYaml . | nindent 6 }}

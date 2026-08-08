@@ -1,0 +1,17 @@
+{{- if .Values.cloudCore.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cloudcore
+  namespace: {{ .Release.Namespace }}
+  {{- with .Values.cloudCore.labels }}
+  labels: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  minAvailable: {{ .Values.cloudCore.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- with .Values.cloudCore.labels }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+{{- end }}
