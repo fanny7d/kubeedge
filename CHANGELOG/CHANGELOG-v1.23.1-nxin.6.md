@@ -40,10 +40,24 @@ ineffective.
 The UID guard is mandatory: a delayed cleanup must not delete a newer Pod that
 reuses the same namespace and name.
 
+## Edge token refresh log correctness
+
+EdgeCore proactively discards a cached projected service account token after
+80 percent of its requested lifetime and immediately asks CloudCore for a new
+token. The successful refresh path previously logged the deliberate cache
+invalidation as `E... token expired`, even though the replacement token was
+stored and the workload remained healthy.
+
+The refresh threshold is now classified as an expected cache miss and logged
+only at verbose level. Database deletion failures, malformed token responses,
+CloudCore request failures, and replacement-token failures remain visible as
+real errors.
+
 ## Required canary gates
 
-1. Pass the complete edgecontroller test package, focused repeated tests, and
-   race tests for status-patch, Pod-status, and bound-token cleanup paths.
+1. Pass the complete edgecontroller test package, focused MetaManager token
+   tests, repeated tests, and race tests for status-patch, Pod-status,
+   bound-token cleanup, and proactive token refresh paths.
 2. Build an immutable `.6-rc` CloudCore from a clean checkout and verify its
    version, commit, clean-tree marker, Go version, platform, binary hash, and
    OCI digest before deployment.
@@ -61,7 +75,10 @@ reuses the same namespace and name.
    business workload restarts.
 7. After convergence, require a bounded steady-state window with no new E/F/W
    records in CloudCore, controller-manager, or the authorized canary edge.
-8. Rebuild all formal cloud and edge artifacts from the final immutable `.6`
+8. Exercise at least one projected service account token refresh on the edge
+   canary. Verify that the expiration timestamp advances, the Pod and container
+   IDs remain unchanged, and no `token expired` error is emitted.
+9. Rebuild all formal cloud and edge artifacts from the final immutable `.6`
    tag; do not promote an RC digest or mix `.5` and `.6` source commits in the
    formal release set.
 

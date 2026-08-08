@@ -17,14 +17,18 @@ limitations under the License.
 package client
 
 import (
+	"bytes"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/api/apis/common/constants"
 	metaserverconfig "github.com/kubeedge/kubeedge/edge/pkg/metamanager/metaserver/config"
@@ -47,6 +51,65 @@ func TestValidateServiceAccountTokenMetaCount(t *testing.T) {
 		assert.False(t, errors.Is(err, errServiceAccountTokenCacheMiss))
 		assert.ErrorContains(t, err, "returned 2 entries")
 	})
+}
+
+func TestRequiresRefreshAt(t *testing.T) {
+	now := time.Date(2026, time.August, 8, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name              string
+		expirationSeconds int64
+		expiresAt         time.Time
+		want              bool
+	}{
+		{
+			name:              "fresh token",
+			expirationSeconds: 3600,
+			expiresAt:         now.Add(13 * time.Minute),
+			want:              false,
+		},
+		{
+			name:              "past proactive refresh threshold",
+			expirationSeconds: 3600,
+			expiresAt:         now.Add(10 * time.Minute),
+			want:              true,
+		},
+		{
+			name:              "older than maximum ttl",
+			expirationSeconds: int64((48 * time.Hour) / time.Second),
+			expiresAt:         now.Add(20 * time.Hour),
+			want:              true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := &authenticationv1.TokenRequest{
+				Spec: authenticationv1.TokenRequestSpec{
+					ExpirationSeconds: &tt.expirationSeconds,
+				},
+				Status: authenticationv1.TokenRequestStatus{
+					ExpirationTimestamp: metav1.NewTime(tt.expiresAt),
+				},
+			}
+			assert.Equal(t, tt.want, requiresRefreshAt(request, now))
+		})
+	}
+}
+
+func TestServiceAccountTokenRefreshError(t *testing.T) {
+	state := klog.CaptureState()
+	t.Cleanup(state.Restore)
+	var errorLogs bytes.Buffer
+	klog.LogToStderr(false)
+	klog.SetOutputBySeverity("ERROR", &errorLogs)
+
+	err := serviceAccountTokenRefreshError("test-key")
+	klog.Flush()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errServiceAccountTokenCacheMiss)
+	assert.ErrorContains(t, err, "token refresh required")
+	assert.Empty(t, errorLogs.String())
 }
 
 func TestKeyFuncNormalizesDefaultAudiences(t *testing.T) {

@@ -72,13 +72,16 @@ func (c *serviceAccountToken) DeleteServiceAccountToken(podUID types.UID) {
 // requiresRefresh returns true if the token is older than 80% of its total
 // ttl, or if the token is older than 24 hours.
 func requiresRefresh(tr *authenticationv1.TokenRequest) bool {
+	return requiresRefreshAt(tr, time.Now())
+}
+
+func requiresRefreshAt(tr *authenticationv1.TokenRequest, now time.Time) bool {
 	if tr.Spec.ExpirationSeconds == nil {
 		cpy := tr.DeepCopy()
 		cpy.Status.Token = ""
 		klog.Errorf("expiration seconds was nil for tr: %#v", cpy)
 		return false
 	}
-	now := time.Now()
 	exp := tr.Status.ExpirationTimestamp.Time
 	iat := exp.Add(-1 * time.Duration(*tr.Spec.ExpirationSeconds) * time.Second)
 
@@ -90,6 +93,14 @@ func requiresRefresh(tr *authenticationv1.TokenRequest) bool {
 		return true
 	}
 	return false
+}
+
+func serviceAccountTokenRefreshError(resKey string) error {
+	// Reaching the proactive refresh threshold is expected cache behavior. The
+	// caller immediately falls back to CloudCore for a replacement token, so it
+	// must not be reported as an EdgeCore failure.
+	klog.V(4).Infof("service account token %s requires refresh", resKey)
+	return fmt.Errorf("%w: token refresh required for %s", errServiceAccountTokenCacheMiss, resKey)
 }
 
 // KeyFunc keys should be nonconfidential and safe to log
@@ -158,8 +169,7 @@ func getTokenLocally(name, namespace string, tr *authenticationv1.TokenRequest) 
 			klog.Errorf("delete meta %s failed: %v", resKey, err)
 			return nil, err
 		}
-		klog.Errorf("resource %s token expired", resKey)
-		return nil, fmt.Errorf("resource %s token expired", resKey)
+		return nil, serviceAccountTokenRefreshError(resKey)
 	}
 	return &tokenRequest, nil
 }
