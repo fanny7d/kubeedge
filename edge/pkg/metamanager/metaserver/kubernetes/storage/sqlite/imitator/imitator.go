@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
@@ -42,15 +43,19 @@ func (s *imitator) Inject(msg model.Message) {
 	for _, e := range s.Event(&msg) {
 		// save to meta_v2
 		var err error
+		served := true
 		switch e.Type {
 		case watch.Added, watch.Modified:
 			err = s.InsertOrUpdateObj(context.TODO(), e.Object)
 		case watch.Deleted:
-			err = s.DeleteObj(context.TODO(), e.Object)
+			served, err = s.deleteObj(context.TODO(), e.Object)
 		}
 		if err != nil {
 			key := metaserver.KeyFunc(e.Object)
-			klog.Errorf("failed to serve event {type:%v,key:%v}", e.Type, key)
+			klog.Errorf("failed to serve event {type:%v,key:%v}: %v", e.Type, key, err)
+			continue
+		}
+		if !served {
 			continue
 		}
 		// TODO: move Trigger inside InsertOrUpdateObj and DeleteObj
@@ -135,12 +140,51 @@ func (s *imitator) InsertOrUpdatePassThroughObj(_ context.Context, obj []byte, k
 }
 
 func (s *imitator) DeleteObj(_ context.Context, obj runtime.Object) error {
+	_, err := s.deleteObj(context.TODO(), obj)
+	return err
+}
+
+// deleteObj deletes only the exact object incarnation represented by obj. A
+// delayed delete must not remove a newer object that reused the same key.
+// The boolean reports whether a row was actually removed so Inject can avoid
+// emitting duplicate or UID-mismatched watch events.
+func (s *imitator) deleteObj(_ context.Context, obj runtime.Object) (bool, error) {
 	key, err := metaserver.KeyFuncObj(obj)
 	if err != nil {
-		return err
+		return false, err
 	}
-	err = s.Delete(context.TODO(), key)
-	return err
+
+	expected, err := meta.Accessor(obj)
+	if err != nil {
+		return false, err
+	}
+
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	row, found, err := dbclient.NewMetaV2Service().FindByKey(key)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		klog.V(4).Infof("[metaserver] skip delete for absent obj:%v", key)
+		return false, nil
+	}
+
+	stored := new(unstructured.Unstructured)
+	if err := runtime.DecodeInto(s.codec, []byte(row.Value), stored); err != nil {
+		return false, fmt.Errorf("decode stored obj %s: %w", key, err)
+	}
+	expectedUID := expected.GetUID()
+	if stored.GetUID() != expectedUID {
+		klog.V(4).Infof("[metaserver] skip stale delete for obj:%v, expected UID:%s, stored UID:%s", key, expectedUID, stored.GetUID())
+		return false, nil
+	}
+
+	if err := dbclient.NewMetaV2Service().DeleteByKey(key); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *imitator) Get(_ context.Context, key string) (Resp, error) {
@@ -223,6 +267,14 @@ func (s *imitator) Event(msg *model.Message) []watch.Event {
 	klog.V(4).Infof("[metaserver] get a message from metamanager: %+v", msg)
 	var ret []watch.Event
 	_, resType, _ := parseResource(msg.Router.Resource)
+	// Edged sends Pod DeleteOptions to request deletion from the Kubernetes API.
+	// It is not an authoritative resource event and has no apiVersion or kind.
+	// The resulting cloud-side Pod deletion is delivered separately with the
+	// actual Pod object, which is the event MetaServer must persist and publish.
+	if resType == model.ResourceTypePod && msg.GetOperation() == model.DeleteOperation && msg.GetSource() == modules.EdgedModuleName {
+		klog.V(4).Info("skip edge-originated pod deletion request")
+		return []watch.Event{}
+	}
 	//skip nodestatus, podstatus and node-lease
 	if strings.Contains(resType, "status") || (strings.Contains(resType, "lease") && msg.GetSource() == modules.EdgedModuleName) {
 		klog.V(4).Infof("skip status or node-lease messages")

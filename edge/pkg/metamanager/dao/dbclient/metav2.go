@@ -98,6 +98,21 @@ func (s *MetaV2Service) GetByKey(key string) (*models.MetaV2, error) {
 	return &result, nil
 }
 
+// FindByKey returns whether a MetaV2 row exists without treating a missing row
+// as a database error. Delete events are idempotent, so callers need to
+// distinguish an already-removed object from a real database failure.
+func (s *MetaV2Service) FindByKey(key string) (*models.MetaV2, bool, error) {
+	var result models.MetaV2
+	tx := s.db.Where(models.KEY+" = ?", key).Limit(1).Find(&result)
+	if tx.Error != nil {
+		return nil, false, tx.Error
+	}
+	if tx.RowsAffected == 0 {
+		return nil, false, nil
+	}
+	return &result, true, nil
+}
+
 func (s *MetaV2Service) DeleteByKey(key string) error {
 	return s.db.Where(models.KEY+" = ?", key).Delete(&models.MetaV2{}).Error
 }

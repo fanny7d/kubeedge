@@ -354,6 +354,11 @@ func TestGcOrphanedClusterObjectSyncFunction(t *testing.T) {
 			}
 
 			buildEdgeControllerMessageFunc = func(nodeID, namespace, resource, resourceID string, operation string, content interface{}) *model.Message {
+				object, ok := content.(*unstructured.Unstructured)
+				assert.True(t, ok, "delete content must be unstructured")
+				if ok {
+					assert.Equal(t, schema.FromAPIVersionAndKind(tt.sync.Spec.ObjectAPIVersion, tt.sync.Spec.ObjectKind), object.GroupVersionKind())
+				}
 				if tt.sendMessage {
 					return &model.Message{}
 				}

@@ -53,6 +53,24 @@ only at verbose level. Database deletion failures, malformed token responses,
 CloudCore request failures, and replacement-token failures remain visible as
 real errors.
 
+## Edge Pod delete-event correctness
+
+Kubelet's final Pod cleanup is sent through MetaManager as a `DeleteOptions`
+request. It is not a Kubernetes resource watch event and therefore has no
+`apiVersion` or `kind`. MetaServer previously attempted to decode it as an
+object and emitted a misleading `Object 'Kind' is missing` error even though
+the Pod, container, token row, and cached metadata were removed successfully.
+
+- Edge-originated Pod deletion requests are forwarded to CloudCore but are no
+  longer injected into the MetaServer watch cache.
+- CloudCore stale-Pod tombstones and SyncController orphan tombstones carry an
+  explicit group/version/kind so authoritative delete events remain decodable.
+- `meta_v2` deletion now requires the cached UID to match the event UID. A
+  delayed delete, including one with an empty UID, cannot remove a same-name
+  replacement object or emit a false `watch.Deleted` event.
+- Repeated deletes and already-absent rows are treated as expected idempotent
+  outcomes; database corruption and actual storage failures remain errors.
+
 ## Required canary gates
 
 1. Pass the complete edgecontroller test package, focused MetaManager token
@@ -78,7 +96,10 @@ real errors.
 8. Exercise at least one projected service account token refresh on the edge
    canary. Verify that the expiration timestamp advances, the Pod and container
    IDs remain unchanged, and no `token expired` error is emitted.
-9. Rebuild all formal cloud and edge artifacts from the final immutable `.6`
+9. Delete the token-refresh canary normally and verify that no `Kind is
+   missing` error is emitted, the exact UID is removed from both metadata
+   tables, and a simulated stale UID cannot delete a same-name replacement.
+10. Rebuild all formal cloud and edge artifacts from the final immutable `.6`
    tag; do not promote an RC digest or mix `.5` and `.6` source commits in the
    formal release set.
 

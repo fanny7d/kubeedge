@@ -428,7 +428,10 @@ func (uc *UpstreamController) deletePodOnEdge(msg model.Message, namespace, name
 		return fmt.Errorf("build pod resource: %w", err)
 	}
 
-	pod := &v1.Pod{ObjectMeta: metaV1.ObjectMeta{Namespace: namespace, Name: name, UID: uid}}
+	pod := &v1.Pod{
+		TypeMeta:   metaV1.TypeMeta{APIVersion: v1.SchemeGroupVersion.String(), Kind: "Pod"},
+		ObjectMeta: metaV1.ObjectMeta{Namespace: namespace, Name: name, UID: uid},
+	}
 	delMsg := model.NewMessage("").
 		FillBody(pod).
 		BuildRouter(modules.EdgeControllerModuleName, constants.GroupResource, resource, model.DeleteOperation)

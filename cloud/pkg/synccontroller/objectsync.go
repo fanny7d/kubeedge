@@ -75,6 +75,8 @@ func (sctl *SyncController) gcOrphanedObjectSync(sync *v1alpha1.ObjectSync) {
 	klog.V(4).Infof("%s: %s has been deleted in K8s, send the delete event to edge in sync loop", resourceType, sync.Spec.ObjectName)
 
 	object := &unstructured.Unstructured{}
+	object.SetAPIVersion(sync.Spec.ObjectAPIVersion)
+	object.SetKind(sync.Spec.ObjectKind)
 	object.SetNamespace(sync.Namespace)
 	object.SetName(sync.Spec.ObjectName)
 	object.SetUID(types.UID(getObjectUID(sync.Name)))

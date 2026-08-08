@@ -93,9 +93,27 @@ func assertPodDeleteMessage(t *testing.T, messages []model.Message, nodeID, name
 		if pod.Namespace != namespace || pod.Name != name || pod.UID != uid {
 			t.Fatalf("pod delete content = %s/%s UID %s, want %s/%s UID %s", pod.Namespace, pod.Name, pod.UID, namespace, name, uid)
 		}
+		if pod.APIVersion != corev1.SchemeGroupVersion.String() || pod.Kind != "Pod" {
+			t.Fatalf("pod delete GVK = %s/%s, want %s/Pod", pod.APIVersion, pod.Kind, corev1.SchemeGroupVersion.String())
+		}
 		return
 	}
 	t.Fatalf("pod delete message for resource %s was not sent", expectedResource)
+}
+
+func TestDeletePodOnEdgeIncludesGVKAndUID(t *testing.T) {
+	layer := &MockMessageLayer{}
+	controller := &UpstreamController{messageLayer: layer}
+	request := model.Message{
+		Router: model.MessageRoute{
+			Resource: "node/test-node/default/podstatus/test-pod",
+		},
+	}
+
+	if err := controller.deletePodOnEdge(request, "default", "test-pod", types.UID("old-pod-uid")); err != nil {
+		t.Fatalf("deletePodOnEdge() error = %v", err)
+	}
+	assertPodDeleteMessage(t, layer.SendMessages, "test-node", "default", "test-pod", types.UID("old-pod-uid"))
 }
 
 var defaultConf = v1alpha1.NewDefaultCloudCoreConfig()

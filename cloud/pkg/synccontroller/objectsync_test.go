@@ -142,6 +142,14 @@ func TestGCOrphanedObjectSync(t *testing.T) {
 			if !reflect.DeepEqual(message.GetResource(), tt.ExpectedResource) {
 				t.Errorf("gcOrphanedObjectSync() = %v, want %v", message.GetResource(), tt.ExpectedResource)
 			}
+			object, ok := message.GetContent().(*unstructured.Unstructured)
+			if !ok {
+				t.Fatalf("gcOrphanedObjectSync() content type = %T, want *unstructured.Unstructured", message.GetContent())
+			}
+			wantGVK := schema.FromAPIVersionAndKind(tt.ObjectSyncs.Spec.ObjectAPIVersion, tt.ObjectSyncs.Spec.ObjectKind)
+			if object.GroupVersionKind() != wantGVK {
+				t.Errorf("gcOrphanedObjectSync() GVK = %v, want %v", object.GroupVersionKind(), wantGVK)
+			}
 		})
 	}
 }
