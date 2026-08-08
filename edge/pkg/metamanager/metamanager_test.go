@@ -19,11 +19,16 @@ package metamanager
 import (
 	"testing"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+
 	"github.com/kubeedge/beehive/pkg/common"
 	"github.com/kubeedge/beehive/pkg/core"
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	"github.com/kubeedge/beehive/pkg/core/model"
 	commodule "github.com/kubeedge/kubeedge/edge/pkg/common/modules"
+	"github.com/kubeedge/kubeedge/edge/pkg/metamanager/client"
 )
 
 // metaModule is metamanager implementation of Module interface
@@ -79,5 +84,37 @@ func TestIsMetaManagerOnlyResource(t *testing.T) {
 				t.Fatalf("isMetaManagerOnlyResource(%q) = %t, want %t", tt.resType, got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestParseServiceAccountTokenResourceKeepsResourceID(t *testing.T) {
+	expirationSeconds := int64(3600)
+	tokenRequest := &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{
+			Audiences:         []string{"https://kubernetes.default.svc"},
+			ExpirationSeconds: &expirationSeconds,
+			BoundObjectRef: &authenticationv1.BoundObjectReference{
+				Kind:       "Pod",
+				APIVersion: corev1.SchemeGroupVersion.String(),
+				Name:       "orangepi-agent-v9r2v",
+				UID:        types.UID("pod-uid"),
+			},
+		},
+	}
+	message := model.NewMessage("").
+		BuildRouter(commodule.EdgedModuleName, commodule.MetaGroup,
+			"led/serviceaccounttoken/orangepi-agent", model.QueryOperation).
+		FillBody(tokenRequest)
+
+	resourceKey, resourceType, resourceID := parseResource(message)
+
+	if want := client.KeyFunc("orangepi-agent", "led", tokenRequest); resourceKey != want {
+		t.Fatalf("resource key = %q, want %q", resourceKey, want)
+	}
+	if resourceType != model.ResourceTypeServiceAccountToken {
+		t.Fatalf("resource type = %q, want %q", resourceType, model.ResourceTypeServiceAccountToken)
+	}
+	if resourceID != "orangepi-agent" {
+		t.Fatalf("resource ID = %q, want %q", resourceID, "orangepi-agent")
 	}
 }

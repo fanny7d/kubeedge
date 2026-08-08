@@ -53,6 +53,15 @@ only at verbose level. Database deletion failures, malformed token responses,
 CloudCore request failures, and replacement-token failures remain visible as
 real errors.
 
+When EdgeCore restarted before CloudHub had reconnected, MetaManager's local
+fallback queried every cached service account token by resource type. A node
+with multiple projected-token workloads therefore returned multiple rows to a
+single-token caller and logged `serviceaccount length from meta db is N` during
+startup. The fallback now retains the request resource ID and queries only the
+exact normalized token cache key. Multiple cached tokens remain supported, and
+a true missing, duplicate, malformed, or expired exact entry still follows the
+existing guarded refresh/error path.
+
 ## Edge Pod delete-event correctness
 
 Kubelet's final Pod cleanup is sent through MetaManager as a `DeleteOptions`

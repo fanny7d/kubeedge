@@ -105,7 +105,10 @@ func parseResource(message *model.Message) (string, string, string) {
 		klog.Errorf("failed to get resource %s name and namespace", resource)
 		return "", "", ""
 	}
-	return client.KeyFunc(trTokens[2], trTokens[0], &tokenReq), resType, ""
+	// Keep the original resource name as resID so an offline query uses the
+	// exact token cache key above instead of returning every cached token of
+	// this type. Multiple projected-token users are normal on an edge node.
+	return client.KeyFunc(trTokens[2], trTokens[0], &tokenReq), resType, trTokens[2]
 }
 
 // is resource type require remote query
