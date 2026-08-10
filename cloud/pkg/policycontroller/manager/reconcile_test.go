@@ -3,10 +3,10 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
-	"sync"
 	"testing"
 	"time"
 
@@ -21,14 +21,40 @@ import (
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	policyv1alpha1 "github.com/kubeedge/api/apis/policy/v1alpha1"
-	"github.com/kubeedge/beehive/pkg/common"
-	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
+	reliablesyncsv1alpha1 "github.com/kubeedge/api/apis/reliablesyncs/v1alpha1"
 	"github.com/kubeedge/beehive/pkg/core/model"
 	"github.com/kubeedge/kubeedge/cloud/pkg/common/messagelayer"
-	"github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
+	"github.com/kubeedge/kubeedge/cloud/pkg/synccontroller"
 )
+
+type getErrorReader struct {
+	client.Reader
+	err error
+}
+
+func (r getErrorReader) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return r.err
+}
+
+type recordingMessageLayer struct {
+	messages []model.Message
+}
+
+func (r *recordingMessageLayer) Send(message model.Message) error {
+	r.messages = append(r.messages, message)
+	return nil
+}
+
+func (*recordingMessageLayer) Receive() (model.Message, error) {
+	return model.Message{}, errors.New("Receive is not implemented by recordingMessageLayer")
+}
+
+func (*recordingMessageLayer) Response(model.Message) error {
+	return errors.New("Response is not implemented by recordingMessageLayer")
+}
 
 func TestIntersectSlice(t *testing.T) {
 	tests := []struct {
@@ -1379,6 +1405,313 @@ func TestGetNodeListOfServiceAccountAccess(t *testing.T) {
 	}
 }
 
+func newTestServiceAccountAccessObjectSync(acc *policyv1alpha1.ServiceAccountAccess, node, resourceVersion string) *reliablesyncsv1alpha1.ObjectSync {
+	return &reliablesyncsv1alpha1.ObjectSync{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      synccontroller.BuildObjectSyncName(node, string(acc.UID)),
+			Namespace: acc.Namespace,
+		},
+		Spec: reliablesyncsv1alpha1.ObjectSyncSpec{
+			ObjectAPIVersion: policyv1alpha1.SchemeGroupVersion.String(),
+			ObjectKind:       serviceAccountAccessKind,
+			ObjectName:       acc.Name,
+		},
+		Status: reliablesyncsv1alpha1.ObjectSyncStatus{ObjectResourceVersion: resourceVersion},
+	}
+}
+
+func TestGetMissingObjectSyncNodes(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := reliablesyncsv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add reliablesync scheme: %v", err)
+	}
+	acc := &policyv1alpha1.ServiceAccountAccess{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "test-namespace",
+			UID:       types.UID("current-access-uid"),
+		},
+	}
+	present := newTestServiceAccountAccessObjectSync(acc, "present-node", "")
+	oldUID := newTestServiceAccountAccessObjectSync(acc, "old-uid-node", "1")
+	oldUID.Name = synccontroller.BuildObjectSyncName("old-uid-node", "old-access-uid")
+	deleting := newTestServiceAccountAccessObjectSync(acc, "deleting-node", "1")
+	now := metav1.Now()
+	deleting.DeletionTimestamp = &now
+	deleting.Finalizers = []string{"test.kubeedge.io/hold"}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(present, oldUID, deleting).Build()
+	controller := &Controller{Client: fakeClient, Reader: fakeClient}
+	got, err := controller.getMissingObjectSyncNodes(context.Background(), acc,
+		[]string{"present-node", "missing-node", "old-uid-node", "deleting-node"})
+	if err != nil {
+		t.Fatalf("getMissingObjectSyncNodes returned error: %v", err)
+	}
+	want := []string{"missing-node", "old-uid-node", "deleting-node"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("getMissingObjectSyncNodes = %v, want %v", got, want)
+	}
+
+	emptyUID := acc.DeepCopy()
+	emptyUID.UID = ""
+	if _, err := controller.getMissingObjectSyncNodes(context.Background(), emptyUID, []string{"present-node"}); err == nil {
+		t.Fatal("expected an error for an empty ServiceAccountAccess UID")
+	}
+
+	readerErr := errors.New("api reader unavailable")
+	controller.Reader = getErrorReader{Reader: fakeClient, err: readerErr}
+	if _, err := controller.getMissingObjectSyncNodes(context.Background(), acc, []string{"present-node"}); !errors.Is(err, readerErr) {
+		t.Fatalf("getMissingObjectSyncNodes error = %v, want wrapped %v", err, readerErr)
+	}
+}
+
+func TestObjectSyncDeletePredicateAndMapping(t *testing.T) {
+	controller := &Controller{}
+	objectSync := &reliablesyncsv1alpha1.ObjectSync{
+		ObjectMeta: metav1.ObjectMeta{Name: "edge-node.access-uid", Namespace: "test-namespace"},
+		Spec: reliablesyncsv1alpha1.ObjectSyncSpec{
+			ObjectKind: serviceAccountAccessKind,
+			ObjectName: "default",
+		},
+	}
+	p := objectSyncDeletePredicate()
+	if p.Create(event.CreateEvent{Object: objectSync}) {
+		t.Fatal("ObjectSync create event must not trigger reconciliation")
+	}
+	if p.Update(event.UpdateEvent{ObjectOld: objectSync, ObjectNew: objectSync.DeepCopy()}) {
+		t.Fatal("ObjectSync update event must not trigger reconciliation")
+	}
+	if !p.Delete(event.DeleteEvent{Object: objectSync}) {
+		t.Fatal("ServiceAccountAccess ObjectSync delete event must trigger reconciliation")
+	}
+
+	want := []controllerruntime.Request{{NamespacedName: client.ObjectKey{Namespace: "test-namespace", Name: "default"}}}
+	if got := controller.mapObjectSyncFunc(context.Background(), objectSync); !reflect.DeepEqual(got, want) {
+		t.Fatalf("mapObjectSyncFunc = %v, want %v", got, want)
+	}
+	nonAccess := objectSync.DeepCopy()
+	nonAccess.Spec.ObjectKind = "Pod"
+	if p.Delete(event.DeleteEvent{Object: nonAccess}) {
+		t.Fatal("non-ServiceAccountAccess ObjectSync delete event must be ignored")
+	}
+	if got := controller.mapObjectSyncFunc(context.Background(), nonAccess); len(got) != 0 {
+		t.Fatalf("mapObjectSyncFunc returned requests for non-access ObjectSync: %v", got)
+	}
+}
+
+func TestEdgeNodeCreatePredicateAndMapping(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := v1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add core scheme: %v", err)
+	}
+	pods := []client.Object{
+		&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-a", Namespace: "ns-a"}, Spec: v1.PodSpec{NodeName: "edge-node", ServiceAccountName: "default"}},
+		&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-b", Namespace: "ns-a"}, Spec: v1.PodSpec{NodeName: "edge-node", ServiceAccountName: "default"}},
+		&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-c", Namespace: "ns-b"}, Spec: v1.PodSpec{NodeName: "edge-node", ServiceAccountName: "agent"}},
+		&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "other-node", Namespace: "ns-c"}, Spec: v1.PodSpec{NodeName: "other-node", ServiceAccountName: "default"}},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pods...).WithIndex(&v1.Pod{}, podNodeNameField, func(object client.Object) []string {
+		return []string{object.(*v1.Pod).Spec.NodeName}
+	}).Build()
+	controller := &Controller{Client: fakeClient, Reader: fakeClient}
+	edgeNode := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "edge-node", Labels: map[string]string{"node-role.kubernetes.io/edge": ""}}}
+	requests := controller.mapNodeFunc(context.Background(), edgeNode)
+	want := []controllerruntime.Request{
+		{NamespacedName: client.ObjectKey{Namespace: "ns-a", Name: "default"}},
+		{NamespacedName: client.ObjectKey{Namespace: "ns-b", Name: "agent"}},
+	}
+	if !reflect.DeepEqual(requests, want) {
+		t.Fatalf("mapNodeFunc = %v, want %v", requests, want)
+	}
+
+	p := edgeNodeCreatePredicate()
+	if !p.Create(event.CreateEvent{Object: edgeNode}) {
+		t.Fatal("edge node create event must trigger reconciliation")
+	}
+	nonEdgeNode := edgeNode.DeepCopy()
+	nonEdgeNode.Labels = nil
+	if p.Create(event.CreateEvent{Object: nonEdgeNode}) {
+		t.Fatal("non-edge node create event must be ignored")
+	}
+	if p.Update(event.UpdateEvent{ObjectOld: edgeNode, ObjectNew: edgeNode.DeepCopy()}) {
+		t.Fatal("edge node heartbeat update must be ignored")
+	}
+	if !p.Update(event.UpdateEvent{ObjectOld: nonEdgeNode, ObjectNew: edgeNode}) {
+		t.Fatal("edge-role label addition must trigger reconciliation")
+	}
+	if !p.Update(event.UpdateEvent{ObjectOld: edgeNode, ObjectNew: nonEdgeNode}) {
+		t.Fatal("edge-role label removal must trigger reconciliation")
+	}
+	if p.Delete(event.DeleteEvent{Object: edgeNode}) {
+		t.Fatal("node delete event must be handled through ObjectSync deletion, not the Node watch")
+	}
+}
+
+func TestServiceAccountAccessRepairEventOrderings(t *testing.T) {
+	const (
+		namespace  = "test-namespace"
+		nodeName   = "edge-node"
+		accessName = "default"
+	)
+	newScheme := func(t *testing.T) *runtime.Scheme {
+		t.Helper()
+		scheme := runtime.NewScheme()
+		for name, add := range map[string]func(*runtime.Scheme) error{
+			"core":         v1.AddToScheme,
+			"rbac":         rbacv1.AddToScheme,
+			"policy":       policyv1alpha1.AddToScheme,
+			"reliablesync": reliablesyncsv1alpha1.AddToScheme,
+		} {
+			if err := add(scheme); err != nil {
+				t.Fatalf("failed to add %s scheme: %v", name, err)
+			}
+		}
+		return scheme
+	}
+	newObjects := func() (*v1.ServiceAccount, *v1.Pod, *v1.Node, *policyv1alpha1.ServiceAccountAccess) {
+		serviceAccount := &v1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+			Name: accessName, Namespace: namespace, UID: types.UID("service-account-uid"),
+		}}
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "workload", Namespace: namespace},
+			Spec: v1.PodSpec{
+				NodeName:           nodeName,
+				ServiceAccountName: accessName,
+			},
+		}
+		node := &v1.Node{ObjectMeta: metav1.ObjectMeta{
+			Name: nodeName, Labels: map[string]string{"node-role.kubernetes.io/edge": ""},
+		}}
+		access := &policyv1alpha1.ServiceAccountAccess{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: accessName, Namespace: namespace, UID: types.UID("service-account-access-uid"),
+			},
+			Spec: policyv1alpha1.AccessSpec{
+				ServiceAccount:    *serviceAccount.DeepCopy(),
+				ServiceAccountUID: serviceAccount.UID,
+			},
+			Status: policyv1alpha1.AccessStatus{NodeList: []string{nodeName}},
+		}
+		return serviceAccount, pod, node, access
+	}
+	newClient := func(t *testing.T, scheme *runtime.Scheme, objects ...client.Object) client.Client {
+		t.Helper()
+		return fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(objects...).
+			WithIndex(&v1.Pod{}, podServiceAccountNameField, func(object client.Object) []string {
+				return []string{object.(*v1.Pod).Spec.ServiceAccountName}
+			}).
+			WithIndex(&v1.Pod{}, podNodeNameField, func(object client.Object) []string {
+				return []string{object.(*v1.Pod).Spec.NodeName}
+			}).
+			WithStatusSubresource(&policyv1alpha1.ServiceAccountAccess{}).
+			Build()
+	}
+	assertMessage := func(t *testing.T, recorder *recordingMessageLayer, operation string) {
+		t.Helper()
+		if len(recorder.messages) != 1 {
+			t.Fatalf("message count = %d, want 1", len(recorder.messages))
+		}
+		message := recorder.messages[0]
+		if message.GetOperation() != operation {
+			t.Fatalf("message operation = %s, want %s", message.GetOperation(), operation)
+		}
+		target, err := messagelayer.GetNodeID(message)
+		if err != nil {
+			t.Fatalf("failed to parse message target: %v", err)
+		}
+		if target != nodeName {
+			t.Fatalf("message target = %s, want %s", target, nodeName)
+		}
+	}
+
+	t.Run("ObjectSync delete before Node create restores deleted access", func(t *testing.T) {
+		serviceAccount, pod, node, access := newObjects()
+		fakeClient := newClient(t, newScheme(t), serviceAccount, pod, access)
+		recorder := &recordingMessageLayer{}
+		controller := &Controller{Client: fakeClient, Reader: fakeClient, MessageLayer: recorder}
+		request := controllerruntime.Request{NamespacedName: client.ObjectKey{Namespace: namespace, Name: accessName}}
+
+		if _, err := controller.Reconcile(context.Background(), request); err != nil {
+			t.Fatalf("reconcile without Node returned error: %v", err)
+		}
+		assertMessage(t, recorder, model.DeleteOperation)
+		if err := fakeClient.Get(context.Background(), request.NamespacedName, &policyv1alpha1.ServiceAccountAccess{}); !apierror.IsNotFound(err) {
+			t.Fatalf("ServiceAccountAccess after Node deletion error = %v, want NotFound", err)
+		}
+
+		if err := fakeClient.Create(context.Background(), node); err != nil {
+			t.Fatalf("failed to recreate Node: %v", err)
+		}
+		requests := controller.mapNodeFunc(context.Background(), node)
+		if len(requests) != 1 || requests[0] != request {
+			t.Fatalf("Node create mapping = %v, want %v", requests, []controllerruntime.Request{request})
+		}
+		recorder.messages = nil
+		result, err := controller.Reconcile(context.Background(), requests[0])
+		if err != nil {
+			t.Fatalf("missing access ensure returned error: %v", err)
+		}
+		if !result.Requeue {
+			t.Fatalf("missing access ensure result = %v, want immediate requeue", result)
+		}
+		if len(recorder.messages) != 0 {
+			t.Fatalf("ensure sent %d messages before normal reconciliation, want 0", len(recorder.messages))
+		}
+
+		result, err = controller.Reconcile(context.Background(), request)
+		if err != nil {
+			t.Fatalf("reconcile restored access returned error: %v", err)
+		}
+		if result != (controllerruntime.Result{}) {
+			t.Fatalf("restored access result = %v, want empty", result)
+		}
+		assertMessage(t, recorder, model.UpdateOperation)
+		restored := &policyv1alpha1.ServiceAccountAccess{}
+		if err := fakeClient.Get(context.Background(), request.NamespacedName, restored); err != nil {
+			t.Fatalf("failed to get restored access: %v", err)
+		}
+		if !reflect.DeepEqual(restored.Status.NodeList, []string{nodeName}) {
+			t.Fatalf("restored nodeList = %v, want %v", restored.Status.NodeList, []string{nodeName})
+		}
+	})
+
+	t.Run("Node create before ObjectSync delete repairs exact missing record", func(t *testing.T) {
+		serviceAccount, pod, node, access := newObjects()
+		objectSync := newTestServiceAccountAccessObjectSync(access, nodeName, "1")
+		fakeClient := newClient(t, newScheme(t), serviceAccount, pod, node, access, objectSync)
+		recorder := &recordingMessageLayer{}
+		controller := &Controller{Client: fakeClient, Reader: fakeClient, MessageLayer: recorder}
+		request := controllerruntime.Request{NamespacedName: client.ObjectKey{Namespace: namespace, Name: accessName}}
+
+		result, err := controller.Reconcile(context.Background(), request)
+		if err != nil {
+			t.Fatalf("stable reconcile returned error: %v", err)
+		}
+		if result != (controllerruntime.Result{}) || len(recorder.messages) != 0 {
+			t.Fatalf("stable reconcile result/messages = %v/%d, want empty/0", result, len(recorder.messages))
+		}
+
+		deletedSnapshot := objectSync.DeepCopy()
+		if err := fakeClient.Delete(context.Background(), objectSync); err != nil {
+			t.Fatalf("failed to delete ObjectSync: %v", err)
+		}
+		requests := controller.mapObjectSyncFunc(context.Background(), deletedSnapshot)
+		if len(requests) != 1 || requests[0] != request {
+			t.Fatalf("ObjectSync delete mapping = %v, want %v", requests, []controllerruntime.Request{request})
+		}
+		result, err = controller.Reconcile(context.Background(), requests[0])
+		if err != nil {
+			t.Fatalf("missing ObjectSync reconcile returned error: %v", err)
+		}
+		if result.RequeueAfter != objectSyncRepairRequeueInterval {
+			t.Fatalf("missing ObjectSync result = %v, want requeueAfter %v", result, objectSyncRepairRequeueInterval)
+		}
+		assertMessage(t, recorder, model.InsertOperation)
+	})
+}
+
 func TestSyncRules(t *testing.T) {
 	var pod1 v1.Pod
 	err := json.Unmarshal([]byte(podStr1), &pod1)
@@ -1472,8 +1805,9 @@ func TestSyncRules(t *testing.T) {
 	var nodeStatus2 = policyv1alpha1.AccessStatus{NodeList: []string{"my-node", "my-node-2"}}
 	var nodeStatus3 = policyv1alpha1.AccessStatus{NodeList: []string{"my-node-2"}}
 	var nodeStatus4 = policyv1alpha1.AccessStatus{NodeList: []string{"my-node-2", "my-node-3"}}
+	var saaUID = types.UID("service-account-access-uid")
 	var saa1 = policyv1alpha1.ServiceAccountAccess{
-		ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace", UID: saaUID},
 		Spec: policyv1alpha1.AccessSpec{
 			ServiceAccount:           sa1,
 			AccessRoleBinding:        []policyv1alpha1.AccessRoleBinding{{RoleBinding: rb1, Rules: role1.Rules}},
@@ -1482,7 +1816,7 @@ func TestSyncRules(t *testing.T) {
 		Status: nodeStatus1,
 	}
 	var saa2 = policyv1alpha1.ServiceAccountAccess{
-		ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace", UID: saaUID},
 		Spec: policyv1alpha1.AccessSpec{
 			ServiceAccount:           sa1,
 			AccessRoleBinding:        []policyv1alpha1.AccessRoleBinding{{RoleBinding: rb1, Rules: role1.Rules}},
@@ -1491,7 +1825,7 @@ func TestSyncRules(t *testing.T) {
 		Status: nodeStatus2,
 	}
 	var saa3 = policyv1alpha1.ServiceAccountAccess{
-		ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace", UID: saaUID},
 		Spec: policyv1alpha1.AccessSpec{
 			ServiceAccount:           sa1,
 			AccessRoleBinding:        []policyv1alpha1.AccessRoleBinding{{RoleBinding: rb1, Rules: role1.Rules}},
@@ -1500,7 +1834,7 @@ func TestSyncRules(t *testing.T) {
 		Status: nodeStatus3,
 	}
 	var saa4 = policyv1alpha1.ServiceAccountAccess{
-		ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace", UID: saaUID},
 		Spec: policyv1alpha1.AccessSpec{
 			ServiceAccount:           sa1,
 			AccessRoleBinding:        []policyv1alpha1.AccessRoleBinding{{RoleBinding: rb1, Rules: role1.Rules}},
@@ -1509,7 +1843,7 @@ func TestSyncRules(t *testing.T) {
 		Status: nodeStatus4,
 	}
 	var saa5 = policyv1alpha1.ServiceAccountAccess{
-		ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace", UID: saaUID},
 		Spec: policyv1alpha1.AccessSpec{
 			ServiceAccount:           sa1,
 			AccessRoleBinding:        []policyv1alpha1.AccessRoleBinding{{RoleBinding: rb1, Rules: role1.Rules}},
@@ -1518,14 +1852,14 @@ func TestSyncRules(t *testing.T) {
 		Status: nodeStatus1,
 	}
 	var saaDiffName = policyv1alpha1.ServiceAccountAccess{
-		ObjectMeta: metav1.ObjectMeta{Name: "sa2", Namespace: "my-namespace"},
+		ObjectMeta: metav1.ObjectMeta{Name: "sa2", Namespace: "my-namespace", UID: types.UID("different-service-account-access-uid")},
 		Spec: policyv1alpha1.AccessSpec{
 			ServiceAccount: sa2,
 		},
 		Status: nodeStatus2,
 	}
 	var saaDeletion = policyv1alpha1.ServiceAccountAccess{
-		ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace", DeletionTimestamp: &metav1.Time{Time: time.Now()}, Finalizers: []string{"test"}},
+		ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace", UID: saaUID, DeletionTimestamp: &metav1.Time{Time: time.Now()}, Finalizers: []string{"test"}},
 		Spec: policyv1alpha1.AccessSpec{
 			ServiceAccount:           sa1,
 			AccessRoleBinding:        []policyv1alpha1.AccessRoleBinding{{RoleBinding: rb1, Rules: role1.Rules}},
@@ -1534,16 +1868,19 @@ func TestSyncRules(t *testing.T) {
 		Status: nodeStatus1,
 	}
 	var tests = []struct {
-		name            string
-		input           *policyv1alpha1.ServiceAccountAccess
-		obj             []client.Object
-		reconcileResult controllerruntime.Result
-		output          *policyv1alpha1.ServiceAccountAccess
-		msgOpr          []string
+		name                   string
+		input                  *policyv1alpha1.ServiceAccountAccess
+		obj                    []client.Object
+		missingObjectSyncNodes []string
+		reconcileResult        controllerruntime.Result
+		output                 *policyv1alpha1.ServiceAccountAccess
+		msgOpr                 []string
+		msgNodes               []string
 	}{
 		{
-			name:  "rolebinding updated only",
-			input: saa1.DeepCopy(),
+			name:                   "rolebinding update sends only Update when ObjectSync is missing",
+			input:                  saa1.DeepCopy(),
+			missingObjectSyncNodes: []string{"my-node"},
 			obj: []client.Object{saa1.DeepCopy(), pod1.DeepCopy(), sa1.DeepCopy(), rb1.DeepCopy(), crb1.DeepCopy(),
 				cr1.DeepCopy(), role1.DeepCopy(), rb2.DeepCopy(), role2.DeepCopy()},
 			reconcileResult: controllerruntime.Result{},
@@ -1555,7 +1892,8 @@ func TestSyncRules(t *testing.T) {
 				},
 				Status: policyv1alpha1.AccessStatus{NodeList: []string{"my-node"}},
 			},
-			msgOpr: []string{model.UpdateOperation},
+			msgOpr:   []string{model.UpdateOperation},
+			msgNodes: []string{"my-node"},
 		},
 		{
 			name:  "rolebinding updated and inserted new node",
@@ -1587,7 +1925,8 @@ func TestSyncRules(t *testing.T) {
 				},
 				Status: policyv1alpha1.AccessStatus{NodeList: []string{"my-node"}},
 			},
-			msgOpr: []string{model.DeleteOperation, model.UpdateOperation},
+			msgOpr:   []string{model.DeleteOperation, model.UpdateOperation},
+			msgNodes: []string{"my-node", "my-node-2"},
 		},
 		{
 			name:  "rolebinding updated and inserted/deleted/updated new node",
@@ -1603,7 +1942,8 @@ func TestSyncRules(t *testing.T) {
 				},
 				Status: policyv1alpha1.AccessStatus{NodeList: []string{"my-node", "my-node-2"}},
 			},
-			msgOpr: []string{model.DeleteOperation, model.UpdateOperation},
+			msgOpr:   []string{model.DeleteOperation, model.UpdateOperation, model.UpdateOperation},
+			msgNodes: []string{"my-node", "my-node-2", "my-node-3"},
 		},
 		{
 			name:            "rolebinding updated and inserted new node with none old node",
@@ -1634,7 +1974,8 @@ func TestSyncRules(t *testing.T) {
 				},
 				Status: policyv1alpha1.AccessStatus{NodeList: []string{}},
 			},
-			msgOpr: []string{model.DeleteOperation},
+			msgOpr:   []string{model.DeleteOperation, model.DeleteOperation},
+			msgNodes: []string{"my-node-2", "my-node-3"},
 		},
 		{
 			name:  "rolebinding updated and updated/deleted node",
@@ -1666,7 +2007,8 @@ func TestSyncRules(t *testing.T) {
 				},
 				Status: policyv1alpha1.AccessStatus{NodeList: []string{}},
 			},
-			msgOpr: []string{},
+			msgOpr:   []string{model.DeleteOperation},
+			msgNodes: []string{"my-node"},
 		},
 		{
 			name:  "service account not found",
@@ -1684,7 +2026,7 @@ func TestSyncRules(t *testing.T) {
 			input: saa1.DeepCopy(),
 			obj: []client.Object{saa1.DeepCopy(), pod1.DeepCopy(), pod2.DeepCopy(), sa1.DeepCopy(), rb1.DeepCopy(),
 				crb1.DeepCopy(), cr1.DeepCopy(), role1.DeepCopy()},
-			reconcileResult: controllerruntime.Result{},
+			reconcileResult: controllerruntime.Result{RequeueAfter: objectSyncRepairRequeueInterval},
 			output: &policyv1alpha1.ServiceAccountAccess{ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace"},
 				Spec: policyv1alpha1.AccessSpec{
 					ServiceAccount:           *sa1.DeepCopy(),
@@ -1694,6 +2036,41 @@ func TestSyncRules(t *testing.T) {
 				Status: policyv1alpha1.AccessStatus{NodeList: []string{"my-node", "my-node-2"}},
 			},
 			msgOpr: []string{model.InsertOperation},
+		},
+		{
+			name:            "stable node list and ObjectSync do not resend",
+			input:           saa1.DeepCopy(),
+			obj:             []client.Object{saa1.DeepCopy(), pod1.DeepCopy(), sa1.DeepCopy(), rb1.DeepCopy(), crb1.DeepCopy(), cr1.DeepCopy(), role1.DeepCopy()},
+			reconcileResult: controllerruntime.Result{},
+			output:          saa1.DeepCopy(),
+			msgOpr:          []string{},
+		},
+		{
+			name:                   "missing ObjectSync is repaired when node list is unchanged",
+			input:                  saa1.DeepCopy(),
+			obj:                    []client.Object{saa1.DeepCopy(), pod1.DeepCopy(), sa1.DeepCopy(), rb1.DeepCopy(), crb1.DeepCopy(), cr1.DeepCopy(), role1.DeepCopy()},
+			missingObjectSyncNodes: []string{"my-node"},
+			reconcileResult:        controllerruntime.Result{RequeueAfter: objectSyncRepairRequeueInterval},
+			output:                 saa1.DeepCopy(),
+			msgOpr:                 []string{model.InsertOperation},
+			msgNodes:               []string{"my-node"},
+		},
+		{
+			name:                   "new node and retained node missing ObjectSync are each inserted once",
+			input:                  saa1.DeepCopy(),
+			obj:                    []client.Object{saa1.DeepCopy(), pod1.DeepCopy(), pod2.DeepCopy(), sa1.DeepCopy(), rb1.DeepCopy(), crb1.DeepCopy(), cr1.DeepCopy(), role1.DeepCopy()},
+			missingObjectSyncNodes: []string{"my-node"},
+			reconcileResult:        controllerruntime.Result{RequeueAfter: objectSyncRepairRequeueInterval},
+			output: &policyv1alpha1.ServiceAccountAccess{ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace"},
+				Spec: policyv1alpha1.AccessSpec{
+					ServiceAccount:           *sa1.DeepCopy(),
+					AccessRoleBinding:        []policyv1alpha1.AccessRoleBinding{{RoleBinding: *rb1.DeepCopy(), Rules: role1.Rules}},
+					AccessClusterRoleBinding: []policyv1alpha1.AccessClusterRoleBinding{{ClusterRoleBinding: *crb1.DeepCopy(), Rules: cr1.Rules}},
+				},
+				Status: policyv1alpha1.AccessStatus{NodeList: []string{"my-node", "my-node-2"}},
+			},
+			msgOpr:   []string{model.InsertOperation, model.InsertOperation},
+			msgNodes: []string{"my-node", "my-node-2"},
 		},
 		{
 			name:  "delete only updates status",
@@ -1740,12 +2117,6 @@ func TestSyncRules(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cloudHub := &common.ModuleInfo{
-				ModuleName: modules.CloudHubModuleName,
-				ModuleType: common.MsgCtxTypeChannel,
-			}
-			beehiveContext.InitContext([]string{common.MsgCtxTypeChannel})
-			beehiveContext.AddModule(cloudHub)
 			var accessScheme = runtime.NewScheme()
 			if err := policyv1alpha1.AddToScheme(accessScheme); err != nil {
 				t.Errorf("Failed to add policyv1alpha1 scheme: %v", err)
@@ -1756,37 +2127,58 @@ func TestSyncRules(t *testing.T) {
 			if err := rbacv1.AddToScheme(accessScheme); err != nil {
 				t.Errorf("Failed to add rbacv1 scheme: %v", err)
 			}
+			if err := reliablesyncsv1alpha1.AddToScheme(accessScheme); err != nil {
+				t.Errorf("Failed to add reliablesyncsv1alpha1 scheme: %v", err)
+			}
 			pdStrategyTypeIndexer := func(obj client.Object) []string {
 				serviceAccountName := "sa1"
 				return []string{serviceAccountName}
 			}
-			fakeClient := fake.NewClientBuilder().WithScheme(accessScheme).WithObjects(tt.obj...).WithLists(nodeList).WithIndex(&v1.Pod{}, "spec.serviceAccountName", pdStrategyTypeIndexer).WithStatusSubresource(tt.input).Build()
+			objects := append([]client.Object(nil), tt.obj...)
+			missingObjectSyncNodes := make(map[string]struct{}, len(tt.missingObjectSyncNodes))
+			for _, node := range tt.missingObjectSyncNodes {
+				missingObjectSyncNodes[node] = struct{}{}
+			}
+			for _, node := range tt.input.Status.NodeList {
+				if _, missing := missingObjectSyncNodes[node]; missing {
+					continue
+				}
+				objects = append(objects, newTestServiceAccountAccessObjectSync(tt.input, node, "1"))
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(accessScheme).WithObjects(objects...).WithLists(nodeList).WithIndex(&v1.Pod{}, podServiceAccountNameField, pdStrategyTypeIndexer).WithStatusSubresource(tt.input).Build()
+			messageLayer := &recordingMessageLayer{}
 			ctr := &Controller{
 				Client:       fakeClient,
 				Reader:       fakeClient,
-				MessageLayer: messagelayer.PolicyControllerMessageLayer(),
+				MessageLayer: messageLayer,
 			}
-			var rst controllerruntime.Result
-			var wg sync.WaitGroup
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				inputObj := tt.input.DeepCopy()
-				rst, err = ctr.Reconcile(context.Background(), controllerruntime.Request{NamespacedName: types.NamespacedName{Name: inputObj.Name, Namespace: inputObj.Namespace}})
-				if err != nil {
-					t.Errorf("TestCase %q Failed to syncRules: %v", tt.name, err)
-				}
-			}()
+			inputObj := tt.input.DeepCopy()
+			rst, err := ctr.Reconcile(context.Background(), controllerruntime.Request{NamespacedName: types.NamespacedName{Name: inputObj.Name, Namespace: inputObj.Namespace}})
+			if err != nil {
+				t.Errorf("TestCase %q Failed to syncRules: %v", tt.name, err)
+			}
 			var oprs []string
-			for range tt.msgOpr {
-				message, _ := beehiveContext.Receive(modules.CloudHubModuleName)
+			var messageNodes []string
+			for _, message := range messageLayer.messages {
 				oprs = append(oprs, message.GetOperation())
+				node, nodeErr := messagelayer.GetNodeID(message)
+				if nodeErr != nil {
+					t.Errorf("TestCase %q failed to parse message node: %v", tt.name, nodeErr)
+				} else {
+					messageNodes = append(messageNodes, node)
+				}
 			}
-			wg.Wait()
 			sort.Strings(oprs)
 			sort.Strings(tt.msgOpr)
 			if !equality.Semantic.DeepEqual(oprs, tt.msgOpr) {
 				t.Errorf("TestCase %q message operation got %v, want %v", tt.name, oprs, tt.msgOpr)
+			}
+			if tt.msgNodes != nil {
+				sort.Strings(messageNodes)
+				sort.Strings(tt.msgNodes)
+				if !equality.Semantic.DeepEqual(messageNodes, tt.msgNodes) {
+					t.Errorf("TestCase %q message nodes got %v, want %v", tt.name, messageNodes, tt.msgNodes)
+				}
 			}
 			if !equality.Semantic.DeepEqual(rst, tt.reconcileResult) {
 				t.Errorf("TestCase %q Expected: %v, got: %v", tt.name, tt.reconcileResult, rst)

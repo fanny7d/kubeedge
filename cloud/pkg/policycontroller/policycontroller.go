@@ -15,6 +15,7 @@ import (
 	controllerruntimemetrics "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	policyv1alpha1 "github.com/kubeedge/api/apis/policy/v1alpha1"
+	reliablesyncsv1alpha1 "github.com/kubeedge/api/apis/reliablesyncs/v1alpha1"
 	"github.com/kubeedge/beehive/pkg/core"
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	"github.com/kubeedge/kubeedge/cloud/pkg/common/messagelayer"
@@ -42,6 +43,7 @@ var accessScheme = runtime.NewScheme()
 func init() {
 	utilruntime.Must(scheme.AddToScheme(accessScheme))
 	utilruntime.Must(policyv1alpha1.AddToScheme(accessScheme))
+	utilruntime.Must(reliablesyncsv1alpha1.AddToScheme(accessScheme))
 }
 
 func policyControllerLeaderElectionNamespace() string {

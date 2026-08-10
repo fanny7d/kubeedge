@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	policyv1alpha1 "github.com/kubeedge/api/apis/policy/v1alpha1"
+	reliablesyncsv1alpha1 "github.com/kubeedge/api/apis/reliablesyncs/v1alpha1"
 	"github.com/kubeedge/beehive/pkg/core"
 	"github.com/kubeedge/kubeedge/cloud/pkg/common/modules"
 	pm "github.com/kubeedge/kubeedge/cloud/pkg/policycontroller/manager"
@@ -108,6 +109,19 @@ func TestAccessScheme(t *testing.T) {
 
 	if _, ok := obj.(*policyv1alpha1.ServiceAccountAccess); !ok {
 		t.Errorf("Expected *policyv1alpha1.ServiceAccountAccess, got %T", obj)
+	}
+
+	objectSyncGVK := schema.GroupVersionKind{
+		Group:   "reliablesyncs.kubeedge.io",
+		Version: "v1alpha1",
+		Kind:    "ObjectSync",
+	}
+	objectSync, err := accessScheme.New(objectSyncGVK)
+	if err != nil {
+		t.Fatalf("Failed to create ObjectSync from scheme: %v", err)
+	}
+	if _, ok := objectSync.(*reliablesyncsv1alpha1.ObjectSync); !ok {
+		t.Errorf("Expected *reliablesyncsv1alpha1.ObjectSync, got %T", objectSync)
 	}
 }
 
