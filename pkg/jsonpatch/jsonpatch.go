@@ -30,7 +30,7 @@ const (
 
 type Operation string
 
-// Items maps the json expression of jsonpatch.
+// Items contains JSON Patch operations.
 type Items []Item
 
 // New returns a new Items.
@@ -38,7 +38,7 @@ func New() Items {
 	return make(Items, 0)
 }
 
-// Add adds a operation of jsonpatch .
+// Add appends a JSON Patch operation.
 func (items Items) Add(op Operation, path string, value any) Items {
 	item := newItem(op, path)
 	if err := item.setValue(value); err != nil {
@@ -49,16 +49,16 @@ func (items Items) Add(op Operation, path string, value any) Items {
 	return append(items, item)
 }
 
-// ToJSON returns the json buffers.
+// ToJSON returns the JSON representation of the patch operations.
 func (items Items) ToJSON() ([]byte, error) {
 	return json.Marshal(items)
 }
 
-// Item is a operation of jsonpatch.
+// Item is a JSON Patch operation.
 type Item struct {
-	Op    Operation `json:"op"`
-	Path  string    `json:"path"`
-	Value string    `json:"value,omitempty"`
+	Op    Operation       `json:"op"`
+	Path  string          `json:"path"`
+	Value json.RawMessage `json:"value,omitempty"`
 }
 
 // newItem returns a new Item.
@@ -69,20 +69,18 @@ func newItem(op Operation, path string) Item {
 	}
 }
 
-// setValue sets a object value to jsonpath. It will convert the structure into a json string.
+// setValue marshals an operation value while preserving its JSON type.
 func (o *Item) setValue(value any) error {
 	if value == nil {
+		if o.Op != OpRemove {
+			o.Value = json.RawMessage("null")
+		}
 		return nil
 	}
-	switch value := value.(type) {
-	case string:
-		o.Value = value
-	default:
-		bff, err := json.Marshal(value)
-		if err != nil {
-			return err
-		}
-		o.Value = string(bff)
+	bff, err := json.Marshal(value)
+	if err != nil {
+		return err
 	}
+	o.Value = bff
 	return nil
 }
