@@ -38,7 +38,7 @@ This proposal addresses the Container Runtime Interface support in edged to enab
 
 ### Goals
 CRI support in edged must:
-* support multiple runtimes like docker, contianerd, cri-o etc.
+* support multiple runtimes like docker, containerd, cri-o etc.
 * Support for corresponding CNI with pause container and IP will be considered later
 
 ### Non-goals
@@ -51,7 +51,7 @@ Currently, Kubernetes kubelet CRI supports container runtimes like containerd, c
 provided using dockershim as well. However, going forward even docker runtime will be supported through only CRI. However,
 currently kubeedge edged supports only docker runtime using the legacy dockertools. Hence, we propose to support multiple
 container runtime in kubeedge edged as follows
-1. Include CRI support as in kubernetes kubelet to support contianerd, cri-o etc
+1. Include CRI support as in kubernetes kubelet to support containerd, cri-o etc
 2. Continue with docker runtime support using legacy dockertools until CRI support for the same is available i.e. support
 for docker runtime using dockershim is not considered in edged
 
@@ -280,4 +280,3 @@ func (gl *GenericLifecycle) updatePodStatus(pod *v1.Pod) error {
   ....
 }
 ```
-
