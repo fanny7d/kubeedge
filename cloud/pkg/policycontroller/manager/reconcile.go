@@ -2,9 +2,12 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -46,6 +49,8 @@ const (
 	objectSyncRepairMaximumBackoff = 5 * time.Minute
 	policyControllerRetryQPS       = 10
 	policyControllerRetryBurst     = 100
+	nodeRetryRequestPrefix         = "__policycontroller_node__/"
+	legacySyncRetryRequestPrefix   = "__policycontroller_legacy_sync__/"
 )
 
 func newPolicyControllerRateLimiter() workqueue.TypedRateLimiter[controllerruntime.Request] {
@@ -67,6 +72,16 @@ type Controller struct {
 }
 
 func (c *Controller) Reconcile(ctx context.Context, request controllerruntime.Request) (controllerruntime.Result, error) {
+	if nodeName, ok := nodeNameFromRetryRequest(request); ok {
+		return c.reconcileNodeEvent(ctx, nodeName)
+	}
+	if objectName, objectUID, ok := legacyObjectSyncFromRetryRequest(request); ok {
+		return c.reconcileLegacyObjectSyncDelete(ctx, request.Namespace, objectName, objectUID)
+	}
+	return c.reconcileServiceAccountAccess(ctx, request)
+}
+
+func (c *Controller) reconcileServiceAccountAccess(ctx context.Context, request controllerruntime.Request) (controllerruntime.Result, error) {
 	acc := &policyv1alpha1.ServiceAccountAccess{}
 	if err := c.Reader.Get(ctx, request.NamespacedName, acc); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -79,6 +94,68 @@ func (c *Controller) Reconcile(ctx context.Context, request controllerruntime.Re
 		return controllerruntime.Result{}, nil
 	}
 	return c.syncRules(ctx, acc)
+}
+
+func encodeRetryRequestComponent(value string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(value))
+}
+
+func decodeRetryRequestComponent(value string) (string, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return "", err
+	}
+	return string(decoded), nil
+}
+
+func newNodeRetryRequest(nodeName string) controllerruntime.Request {
+	return controllerruntime.Request{NamespacedName: client.ObjectKey{
+		Name: nodeRetryRequestPrefix + encodeRetryRequestComponent(nodeName),
+	}}
+}
+
+func nodeNameFromRetryRequest(request controllerruntime.Request) (string, bool) {
+	if request.Namespace != "" || !strings.HasPrefix(request.Name, nodeRetryRequestPrefix) {
+		return "", false
+	}
+	nodeName, err := decodeRetryRequestComponent(strings.TrimPrefix(request.Name, nodeRetryRequestPrefix))
+	return nodeName, err == nil && nodeName != ""
+}
+
+func newLegacyObjectSyncRetryRequest(namespace, objectName, objectUID string) controllerruntime.Request {
+	return controllerruntime.Request{NamespacedName: client.ObjectKey{
+		Namespace: namespace,
+		Name: legacySyncRetryRequestPrefix + encodeRetryRequestComponent(objectName) + "." +
+			encodeRetryRequestComponent(objectUID),
+	}}
+}
+
+func legacyObjectSyncFromRetryRequest(request controllerruntime.Request) (string, string, bool) {
+	if !strings.HasPrefix(request.Name, legacySyncRetryRequestPrefix) {
+		return "", "", false
+	}
+	encoded := strings.TrimPrefix(request.Name, legacySyncRetryRequestPrefix)
+	parts := strings.Split(encoded, ".")
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	objectName, err := decodeRetryRequestComponent(parts[0])
+	if err != nil || objectName == "" {
+		return "", "", false
+	}
+	objectUID, err := decodeRetryRequestComponent(parts[1])
+	if err != nil || objectUID == "" {
+		return "", "", false
+	}
+	return objectName, objectUID, true
+}
+
+func objectSyncObjectUID(name string) string {
+	separator := strings.LastIndex(name, ".")
+	if separator < 0 || separator == len(name)-1 {
+		return ""
+	}
+	return name[separator+1:]
 }
 
 // ensureServiceAccountAccess restores a controller-owned access object when a
@@ -283,10 +360,31 @@ func (c *Controller) mapObjectFunc(_ context.Context, object client.Object) []co
 	return []controllerruntime.Request{}
 }
 
-func (c *Controller) mapObjectSyncFunc(_ context.Context, object client.Object) []controllerruntime.Request {
+func (c *Controller) mapObjectSyncFunc(ctx context.Context, object client.Object) []controllerruntime.Request {
 	objectSync, ok := object.(*reliablesyncsv1alpha1.ObjectSync)
 	if !ok || !isServiceAccountAccessObjectSync(objectSync) {
 		return nil
+	}
+	if objectSync.Spec.ObjectKind == "" {
+		objectUID := objectSyncObjectUID(objectSync.Name)
+		acc := &policyv1alpha1.ServiceAccountAccess{}
+		reader := client.Reader(c.Client)
+		if reader == nil {
+			reader = c.Reader
+		}
+		if reader == nil {
+			return []controllerruntime.Request{newLegacyObjectSyncRetryRequest(
+				objectSync.Namespace, objectSync.Spec.ObjectName, objectUID)}
+		}
+		err := reader.Get(ctx, client.ObjectKey{Namespace: objectSync.Namespace, Name: objectSync.Spec.ObjectName}, acc)
+		if apierrors.IsNotFound(err) || (err == nil && string(acc.UID) != objectUID) {
+			return nil
+		}
+		if err != nil {
+			klog.Errorf("failed to classify legacy ObjectSync delete %s/%s, %v", objectSync.Namespace, objectSync.Name, err)
+			return []controllerruntime.Request{newLegacyObjectSyncRetryRequest(
+				objectSync.Namespace, objectSync.Spec.ObjectName, objectUID)}
+		}
 	}
 	return []controllerruntime.Request{{NamespacedName: client.ObjectKey{
 		Namespace: objectSync.Namespace,
@@ -295,12 +393,13 @@ func (c *Controller) mapObjectSyncFunc(_ context.Context, object client.Object) 
 }
 
 func isServiceAccountAccessObjectSync(objectSync *reliablesyncsv1alpha1.ObjectSync) bool {
-	// Older CloudCore versions persisted ServiceAccountAccess ObjectSyncs with
-	// an empty kind. Mapping those delete events is safe because Reconcile later
-	// verifies the exact ObjectSync name derived from the live access object's UID.
-	return objectSync != nil &&
-		(objectSync.Spec.ObjectKind == serviceAccountAccessKind || objectSync.Spec.ObjectKind == "") &&
-		objectSync.Spec.ObjectName != ""
+	if objectSync == nil || objectSync.Spec.ObjectName == "" {
+		return false
+	}
+	if objectSync.Spec.ObjectKind == serviceAccountAccessKind {
+		return true
+	}
+	return objectSync.Spec.ObjectKind == "" && objectSyncObjectUID(objectSync.Name) != ""
 }
 
 func (c *Controller) mapNodeFunc(ctx context.Context, object client.Object) []controllerruntime.Request {
@@ -308,10 +407,25 @@ func (c *Controller) mapNodeFunc(ctx context.Context, object client.Object) []co
 	if !ok {
 		return nil
 	}
-	podList := &corev1.PodList{}
-	if err := c.Reader.List(ctx, podList, client.MatchingFields{podNodeNameField: node.Name}); err != nil {
+	reader := client.Reader(c.Client)
+	if reader == nil {
+		reader = c.Reader
+	}
+	requests, err := serviceAccountAccessRequestsForNode(ctx, reader, node.Name)
+	if err != nil {
 		klog.Errorf("failed to list pods on edge node %s, %v", node.Name, err)
-		return nil
+		return []controllerruntime.Request{newNodeRetryRequest(node.Name)}
+	}
+	return requests
+}
+
+func serviceAccountAccessRequestsForNode(ctx context.Context, reader client.Reader, nodeName string) ([]controllerruntime.Request, error) {
+	if reader == nil {
+		return nil, fmt.Errorf("reader is nil")
+	}
+	podList := &corev1.PodList{}
+	if err := reader.List(ctx, podList, client.MatchingFields{podNodeNameField: nodeName}); err != nil {
+		return nil, err
 	}
 
 	requestSet := make(map[client.ObjectKey]struct{})
@@ -333,7 +447,44 @@ func (c *Controller) mapNodeFunc(ctx context.Context, object client.Object) []co
 		}
 		return requests[i].Namespace < requests[j].Namespace
 	})
-	return requests
+	return requests, nil
+}
+
+func (c *Controller) reconcileNodeEvent(ctx context.Context, nodeName string) (controllerruntime.Result, error) {
+	requests, err := serviceAccountAccessRequestsForNode(ctx, c.Reader, nodeName)
+	if err != nil {
+		return controllerruntime.Result{}, fmt.Errorf("failed to retry pods on edge node %s: %w", nodeName, err)
+	}
+
+	var reconcileErrors []error
+	requeue := false
+	for _, request := range requests {
+		result, reconcileErr := c.reconcileServiceAccountAccess(ctx, request)
+		if reconcileErr != nil {
+			reconcileErrors = append(reconcileErrors, fmt.Errorf("failed to reconcile %s/%s for edge node %s: %w",
+				request.Namespace, request.Name, nodeName, reconcileErr))
+			continue
+		}
+		requeue = requeue || result.Requeue || result.RequeueAfter > 0
+	}
+	if err := errors.Join(reconcileErrors...); err != nil {
+		return controllerruntime.Result{}, err
+	}
+	return controllerruntime.Result{Requeue: requeue}, nil
+}
+
+func (c *Controller) reconcileLegacyObjectSyncDelete(ctx context.Context, namespace, objectName, objectUID string) (controllerruntime.Result, error) {
+	acc := &policyv1alpha1.ServiceAccountAccess{}
+	if err := c.Reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: objectName}, acc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return controllerruntime.Result{}, nil
+		}
+		return controllerruntime.Result{}, fmt.Errorf("failed to classify legacy ObjectSync for %s/%s: %w", namespace, objectName, err)
+	}
+	if string(acc.UID) != objectUID || !acc.GetDeletionTimestamp().IsZero() {
+		return controllerruntime.Result{}, nil
+	}
+	return c.syncRules(ctx, acc)
 }
 
 func isEdgeNodeObject(object client.Object) bool {
@@ -371,6 +522,31 @@ func edgeNodeCreatePredicate() predicate.Funcs {
 	}
 }
 
+func (c *Controller) podEventPredicate(ctx context.Context) predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return e.Object != nil && c.filterObject(ctx, e.Object)
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldPod, oldOK := e.ObjectOld.(*corev1.Pod)
+			newPod, newOK := e.ObjectNew.(*corev1.Pod)
+			if !oldOK || !newOK {
+				return false
+			}
+			if oldPod.Spec.NodeName == newPod.Spec.NodeName &&
+				oldPod.Spec.ServiceAccountName == newPod.Spec.ServiceAccountName &&
+				(oldPod.DeletionTimestamp == nil) == (newPod.DeletionTimestamp == nil) {
+				return false
+			}
+			return c.filterObject(ctx, newPod)
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return e.Object != nil && c.filterObject(ctx, e.Object)
+		},
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+}
+
 func (c *Controller) filterObject(ctx context.Context, object client.Object) bool {
 	switch obj := object.(type) {
 	case *corev1.Pod:
@@ -402,6 +578,12 @@ func (c *Controller) SetupWithManager(ctx context.Context, mgr controllerruntime
 	}); err != nil {
 		return fmt.Errorf("failed to set ServiceAccountName field selector for manager, %v", err)
 	}
+	if err := mgr.GetFieldIndexer().IndexField(ctx, &corev1.Pod{}, podNodeNameField, func(o client.Object) []string {
+		pod := o.(*corev1.Pod)
+		return []string{pod.Spec.NodeName}
+	}); err != nil {
+		return fmt.Errorf("failed to set NodeName field selector for manager, %v", err)
+	}
 	return controllerruntime.NewControllerManagedBy(mgr).
 		WithOptions(controllerconfig.Options{RateLimiter: newPolicyControllerRateLimiter()}).
 		For(&policyv1alpha1.ServiceAccountAccess{}).
@@ -422,9 +604,7 @@ func (c *Controller) SetupWithManager(ctx context.Context, mgr controllerruntime
 		Watches(&corev1.ServiceAccount{}, handler.EnqueueRequestsFromMapFunc(c.mapObjectFunc), builder.WithPredicates(predicate.NewPredicateFuncs(func(object client.Object) bool {
 			return c.filterObject(ctx, object)
 		}))).
-		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(c.mapObjectFunc), builder.WithPredicates(predicate.NewPredicateFuncs(func(object client.Object) bool {
-			return c.filterObject(ctx, object)
-		}))).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(c.mapObjectFunc), builder.WithPredicates(c.podEventPredicate(ctx))).
 		Complete(c)
 }
 
@@ -486,6 +666,19 @@ func objectSyncSpecNeedsBackfill(objectSync *reliablesyncsv1alpha1.ObjectSync) b
 			objectSync.Spec.ObjectName == "")
 }
 
+func (c *Controller) getObjectSync(ctx context.Context, key client.ObjectKey, objectSync *reliablesyncsv1alpha1.ObjectSync) error {
+	if c.Client == nil {
+		return c.Reader.Get(ctx, key, objectSync)
+	}
+	err := c.Client.Get(ctx, key, objectSync)
+	if !apierrors.IsNotFound(err) || c.Reader == nil {
+		return err
+	}
+	// A cache miss is confirmed against the API server before a repair message is
+	// sent. Existing ObjectSyncs stay on the cache-backed hot path.
+	return c.Reader.Get(ctx, key, objectSync)
+}
+
 func (c *Controller) getObjectSyncRepairTargets(ctx context.Context, acc *policyv1alpha1.ServiceAccountAccess, nodes []string) (objectSyncRepairTargets, error) {
 	targets := objectSyncRepairTargets{}
 	if len(nodes) == 0 {
@@ -498,7 +691,7 @@ func (c *Controller) getObjectSyncRepairTargets(ctx context.Context, acc *policy
 	for _, node := range nodes {
 		name := synccontroller.BuildObjectSyncName(node, string(acc.UID))
 		objectSync := &reliablesyncsv1alpha1.ObjectSync{}
-		err := c.Reader.Get(ctx, client.ObjectKey{Namespace: acc.Namespace, Name: name}, objectSync)
+		err := c.getObjectSync(ctx, client.ObjectKey{Namespace: acc.Namespace, Name: name}, objectSync)
 		if apierrors.IsNotFound(err) {
 			targets.nodes = append(targets.nodes, node)
 			targets.missingNodes = append(targets.missingNodes, node)
@@ -588,7 +781,10 @@ func (c *Controller) syncRules(ctx context.Context, acc *policyv1alpha1.ServiceA
 	}
 	userInfo := serviceaccount.UserInfo(newSA.Namespace, newSA.Name, string(newSA.UID))
 	var currentAcc = &policyv1alpha1.ServiceAccountAccess{}
-	c.VisitRulesFor(ctx, userInfo, acc.Namespace, currentAcc)
+	if err := c.VisitRulesFor(ctx, userInfo, acc.Namespace, currentAcc); err != nil {
+		return controllerruntime.Result{}, fmt.Errorf("failed to resolve authorization rules for serviceaccountaccess %s/%s: %w",
+			acc.Namespace, acc.Name, err)
+	}
 	nodes, err := getNodeListOfServiceAccountAccess(ctx, c.Reader, acc)
 	if err != nil {
 		klog.Errorf("failed to get node list of serviceaccountaccess %s/%s, %v", acc.Namespace, acc.Name, err)
@@ -803,11 +999,10 @@ func (c *Controller) GetRoleReferenceRules(ctx context.Context, roleRef rbacv1.R
 	}
 }
 
-func (c *Controller) VisitRulesFor(ctx context.Context, user user.Info, namespace string, acc *policyv1alpha1.ServiceAccountAccess) {
+func (c *Controller) VisitRulesFor(ctx context.Context, user user.Info, namespace string, acc *policyv1alpha1.ServiceAccountAccess) error {
 	crbl := &rbacv1.ClusterRoleBindingList{}
 	if err := c.Reader.List(ctx, crbl); err != nil {
-		klog.Errorf("failed to list clusterrolebindings, %v", err)
-		return
+		return fmt.Errorf("failed to list clusterrolebindings: %w", err)
 	}
 	for _, crb := range crbl.Items {
 		_, applies := appliesTo(user, crb.Subjects, "")
@@ -816,8 +1011,7 @@ func (c *Controller) VisitRulesFor(ctx context.Context, user user.Info, namespac
 		}
 		rules, err := c.GetRoleReferenceRules(ctx, crb.RoleRef, "")
 		if err != nil {
-			klog.Errorf("failed to get rules for clusterrolebinding %s, %v", crb.Name, err)
-			return
+			return fmt.Errorf("failed to get rules for clusterrolebinding %s: %w", crb.Name, err)
 		}
 		var accessClusterRoleBinding = policyv1alpha1.AccessClusterRoleBinding{
 			ClusterRoleBinding: crb,
@@ -829,8 +1023,7 @@ func (c *Controller) VisitRulesFor(ctx context.Context, user user.Info, namespac
 	if len(namespace) > 0 {
 		var roleBindingList = &rbacv1.RoleBindingList{}
 		if err := c.Reader.List(ctx, roleBindingList, &client.ListOptions{Namespace: namespace}); err != nil {
-			klog.Errorf("failed to list rolebindings, %v", err)
-			return
+			return fmt.Errorf("failed to list rolebindings in namespace %s: %w", namespace, err)
 		}
 		for _, roleBinding := range roleBindingList.Items {
 			_, applies := appliesTo(user, roleBinding.Subjects, namespace)
@@ -839,8 +1032,7 @@ func (c *Controller) VisitRulesFor(ctx context.Context, user user.Info, namespac
 			}
 			rules, err := c.GetRoleReferenceRules(ctx, roleBinding.RoleRef, namespace)
 			if err != nil {
-				klog.Errorf("failed to get rules for rolebinding %s, %v", roleBinding.Name, err)
-				return
+				return fmt.Errorf("failed to get rules for rolebinding %s/%s: %w", namespace, roleBinding.Name, err)
 			}
 			var accessRoleBinding = policyv1alpha1.AccessRoleBinding{
 				RoleBinding: roleBinding,
@@ -849,4 +1041,5 @@ func (c *Controller) VisitRulesFor(ctx context.Context, user user.Info, namespac
 			acc.Spec.AccessRoleBinding = append(acc.Spec.AccessRoleBinding, accessRoleBinding)
 		}
 	}
+	return nil
 }

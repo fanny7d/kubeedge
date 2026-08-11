@@ -14,7 +14,7 @@ rules:
   verbs: ["get", "list", "watch", "create", "update", "delete"]
 - apiGroups: ["rbac.authorization.k8s.io"]
   resources: ["roles", "clusterrolebindings", "rolebindings", "clusterroles"]
-  verbs: ["list", "watch"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: ["certificates.k8s.io"]
   resources: ["certificatesigningrequests"]
   verbs: ["create", "get", "list", "watch"]
