@@ -17,64 +17,80 @@ limitations under the License.
 package jsonpatch
 
 import (
-	"fmt"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func TestJosnPath(t *testing.T) {
+func TestJSONPatch(t *testing.T) {
 	type beer struct {
 		Number int    `json:"numb"`
 		Str    string `json:"str"`
 	}
 	cases := []struct {
+		name  string
 		op    Operation
 		path  string
 		value any
-		want  string
+		want  []map[string]any
 	}{
 		{
+			name:  "add string",
 			op:    OpAdd,
 			path:  "/a/b/c",
 			value: "123",
-			want:  `[{"op":"add","path":"/a/b/c","value":"123"}]`,
+			want:  []map[string]any{{"op": "add", "path": "/a/b/c", "value": "123"}},
 		},
 		{
+			name: "remove without value",
 			op:   OpRemove,
 			path: "/a/b/c",
-			want: `[{"op":"remove","path":"/a/b/c"}]`,
+			want: []map[string]any{{"op": "remove", "path": "/a/b/c"}},
 		},
 		{
+			name: "add null",
+			op:   OpAdd,
+			path: "/a/b/c",
+			want: []map[string]any{{"op": "add", "path": "/a/b/c", "value": nil}},
+		},
+		{
+			name:  "replace integer",
 			op:    OpReplace,
 			path:  "/a/b/c",
 			value: int32(1),
-			want:  `[{"op":"replace","path":"/a/b/c","value":"1"}]`,
+			want:  []map[string]any{{"op": "replace", "path": "/a/b/c", "value": float64(1)}},
 		},
 		{
+			name:  "replace boolean",
 			op:    OpReplace,
 			path:  "/a/b/c",
 			value: true,
-			want:  `[{"op":"replace","path":"/a/b/c","value":"true"}]`,
+			want:  []map[string]any{{"op": "replace", "path": "/a/b/c", "value": true}},
 		},
 		{
+			name:  "replace number",
 			op:    OpReplace,
 			path:  "/a/b/c",
 			value: 3.14,
-			want:  `[{"op":"replace","path":"/a/b/c","value":"3.14"}]`,
+			want:  []map[string]any{{"op": "replace", "path": "/a/b/c", "value": 3.14}},
 		},
 		{
+			name:  "add object",
 			op:    OpAdd,
 			path:  "/a/b/c",
 			value: beer{Number: 10, Str: "Hello"},
-			want:  `[{"op":"add","path":"/a/b/c","value":"{\"numb\":10,\"str\":\"Hello\"}"}]`,
+			want:  []map[string]any{{"op": "add", "path": "/a/b/c", "value": map[string]any{"numb": float64(10), "str": "Hello"}}},
 		},
 	}
-	for i, c := range cases {
-		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
 			bff, err := New().Add(c.op, c.path, c.value).ToJSON()
 			assert.NoError(t, err)
-			assert.Equal(t, c.want, string(bff))
+
+			var got []map[string]any
+			assert.NoError(t, json.Unmarshal(bff, &got))
+			assert.Equal(t, c.want, got)
 		})
 	}
 }
