@@ -8,7 +8,7 @@
   `7a58297e79807a56573b92a27c18d08d38f78fb0` and adds the bounded
   PolicyController repair described below. It must not be built from `master`
   or another moving branch.
-- `v1.23.1-nxin.7-rc.2` supersedes the immutable `rc.1` tag as a
+- `v1.23.1-nxin.7-rc.3` supersedes the immutable `rc.2` tag as a
   CloudCore-only release candidate. EdgeCore, controller-manager, keadm,
   offline archives, and installation images remain pinned to
   `v1.23.1-nxin.6` and must not be rebuilt or rolled with this RC.
@@ -16,6 +16,9 @@
   retain the same upstream KubeEdge `v1.23.1` API and cloud-edge protocol
   baseline. Any future shared API, CloudHub/EdgeHub protocol, or edge-side
   change must trigger a coordinated EdgeCore build and compatibility canary.
+- The rc.3 source line starts from the immutable rc.2 commit and deliberately
+  excludes the unrelated JSON patch and `cri.md` changes later merged into the
+  previous release branch.
 
 ## Root cause
 
@@ -48,6 +51,14 @@ finalizer prolonged ServiceAccount deletion while a matching Pod remained, the
 controller could alternate between deleting and recreating its
 ServiceAccountAccess and repeatedly send delete snapshots.
 
+The rc.2 legacy delete predicate accepted every ObjectSync with an empty kind
+and non-empty object name. A node garbage collection in a cluster containing
+unrelated legacy records could therefore enqueue unrelated requests on the
+single-worker PolicyController. Node-create mapping also performed a direct Pod
+list in an event mapper, where a transient failure could not be retried. Finally,
+Role and ClusterRole reads used APIReader without matching chart RBAC, and a
+failed rule read could be mistaken for a valid partial authorization snapshot.
+
 ## Fix
 
 - Persist every ServiceAccountAccess node-list change, including delete-only
@@ -61,8 +72,10 @@ ServiceAccountAccess and repeatedly send delete snapshots.
   requests without a live workload do not recreate an orphan object.
 - Watch only deletion of ServiceAccountAccess ObjectSync records. ObjectSync
   create, status update, and generic events do not enqueue reconciliation.
-  Legacy delete records with an empty kind are also mapped by object name; the
-  reconcile path performs the final exact current-UID check.
+  A legacy empty-kind delete is enqueued only when a cache lookup confirms that
+  its object name and UID identify the live ServiceAccountAccess. A cache read
+  failure is converted to an internal request whose API read can be retried;
+  old-UID and unrelated legacy records are ignored.
 - When the ServiceAccountAccess spec is unchanged, verify the exact
   namespace/name pair derived from the live ServiceAccountAccess UID and each
   retained node. Only an API `NotFound` (or an ObjectSync already terminating)
@@ -76,24 +89,32 @@ ServiceAccountAccess and repeatedly send delete snapshots.
   capped at five minutes; a successful reconcile clears the retry state.
 - Return a zero reconcile result with errors so controller-runtime does not add
   its warning about a non-zero result being ignored.
-- Grant the authorization feature role the `get` permissions already required
-  by APIReader for ServiceAccounts and ServiceAccountAccesses.
+- Index Pods by node name and use the cache for normal Node event mapping. A
+  mapping failure becomes a rate-limited Node request and is retried from
+  Reconcile instead of losing the one-shot create event.
+- Ignore Pod status-only and generic events. Existing ObjectSync checks use the
+  manager cache, with APIReader confirmation only for cache misses, so retained
+  nodes no longer produce one direct API read each on the normal hot path.
+- Grant the authorization feature role every `get` permission required by
+  APIReader, including Roles and ClusterRoles. Propagate rule list/get failures
+  to Reconcile so an incomplete snapshot is never persisted or sent.
 
 This repair is cluster-wide. A named edge node can be used as the first
 acceptance probe, but it is not an allowlist and does not bound the repair to
 that node.
 
-## Verification gates for v1.23.1-nxin.7-rc.2
+## Verification gates for v1.23.1-nxin.7-rc.3
 
 1. Pass PolicyController unit and race tests, including exact current-UID
    ObjectSync lookup, old-UID rejection, in-flight handling, event predicate
-   filtering, deduplicated Node mapping, terminating-ServiceAccount loop
-   prevention, legacy empty-spec backfill, bounded retry, and exact message
-   targets.
+   filtering, exact legacy delete UID classification, retryable Node mapping,
+   Pod status filtering, terminating-ServiceAccount loop prevention, legacy
+   empty-spec backfill, rule-read failure preservation, bounded retry, and exact
+   message targets.
 2. Pass SyncController and CloudHub regression tests and compile CloudCore for
    Linux/amd64.
 3. Build and push only the CloudCore Linux/amd64 image from a clean checkout of
-   the immutable `v1.23.1-nxin.7-rc.2` tag. Record and deploy the OCI index
+   the immutable `v1.23.1-nxin.7-rc.3` tag. Record and deploy the OCI index
    digest rather than a mutable tag or only a platform-manifest digest.
 4. Roll the three CloudCore replicas with at least two continuously Ready,
    preserve the Service/NLB identity and Secret checksum, and allow at most one
@@ -112,8 +133,8 @@ that node.
 
 ## Rollback
 
-Roll CloudCore back to the digest-pinned `rc.1` Helm revision that preceded
-`rc.2`, without replacing the Service, NLB, or Secret. Newly repaired
+Roll CloudCore back to the digest-pinned `rc.2` Helm revision that preceded
+`rc.3`, without replacing the Service, NLB, or Secret. Newly repaired
 ObjectSync records are compatible with the previous CloudCore and should not
 be deleted during rollback. EdgeCore and controller-manager remain on `.6`
 throughout, so they require no rollback action.
