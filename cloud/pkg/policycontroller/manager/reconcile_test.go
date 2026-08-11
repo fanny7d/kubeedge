@@ -1420,7 +1420,31 @@ func newTestServiceAccountAccessObjectSync(acc *policyv1alpha1.ServiceAccountAcc
 	}
 }
 
-func TestGetMissingObjectSyncNodes(t *testing.T) {
+func TestPolicyControllerRateLimiter(t *testing.T) {
+	limiter := newPolicyControllerRateLimiter()
+	request := controllerruntime.Request{NamespacedName: client.ObjectKey{Namespace: "test-namespace", Name: "default"}}
+	want := []time.Duration{
+		5 * time.Second,
+		10 * time.Second,
+		20 * time.Second,
+		40 * time.Second,
+		80 * time.Second,
+		160 * time.Second,
+		objectSyncRepairMaximumBackoff,
+		objectSyncRepairMaximumBackoff,
+	}
+	for i, expected := range want {
+		if got := limiter.When(request); got != expected {
+			t.Fatalf("retry %d delay = %v, want %v", i+1, got, expected)
+		}
+	}
+	limiter.Forget(request)
+	if got := limiter.When(request); got != objectSyncRepairInitialBackoff {
+		t.Fatalf("delay after Forget = %v, want %v", got, objectSyncRepairInitialBackoff)
+	}
+}
+
+func TestGetObjectSyncRepairTargets(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := reliablesyncsv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("failed to add reliablesync scheme: %v", err)
@@ -1433,35 +1457,43 @@ func TestGetMissingObjectSyncNodes(t *testing.T) {
 		},
 	}
 	present := newTestServiceAccountAccessObjectSync(acc, "present-node", "")
+	stale := newTestServiceAccountAccessObjectSync(acc, "stale-node", "1")
 	oldUID := newTestServiceAccountAccessObjectSync(acc, "old-uid-node", "1")
 	oldUID.Name = synccontroller.BuildObjectSyncName("old-uid-node", "old-access-uid")
 	deleting := newTestServiceAccountAccessObjectSync(acc, "deleting-node", "1")
 	now := metav1.Now()
 	deleting.DeletionTimestamp = &now
 	deleting.Finalizers = []string{"test.kubeedge.io/hold"}
+	legacy := newTestServiceAccountAccessObjectSync(acc, "legacy-node", "0")
+	legacy.Spec.ObjectAPIVersion = ""
+	legacy.Spec.ObjectKind = ""
 
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(present, oldUID, deleting).Build()
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(present, stale, oldUID, deleting, legacy).Build()
 	controller := &Controller{Client: fakeClient, Reader: fakeClient}
-	got, err := controller.getMissingObjectSyncNodes(context.Background(), acc,
-		[]string{"present-node", "missing-node", "old-uid-node", "deleting-node"})
+	got, err := controller.getObjectSyncRepairTargets(context.Background(), acc,
+		[]string{"present-node", "stale-node", "missing-node", "old-uid-node", "deleting-node", "legacy-node"})
 	if err != nil {
-		t.Fatalf("getMissingObjectSyncNodes returned error: %v", err)
+		t.Fatalf("getObjectSyncRepairTargets returned error: %v", err)
 	}
-	want := []string{"missing-node", "old-uid-node", "deleting-node"}
+	want := objectSyncRepairTargets{
+		nodes:               []string{"missing-node", "old-uid-node", "deleting-node", "legacy-node"},
+		missingNodes:        []string{"missing-node", "old-uid-node", "deleting-node"},
+		incompleteSpecNodes: []string{"legacy-node"},
+	}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("getMissingObjectSyncNodes = %v, want %v", got, want)
+		t.Fatalf("getObjectSyncRepairTargets = %#v, want %#v", got, want)
 	}
 
 	emptyUID := acc.DeepCopy()
 	emptyUID.UID = ""
-	if _, err := controller.getMissingObjectSyncNodes(context.Background(), emptyUID, []string{"present-node"}); err == nil {
+	if _, err := controller.getObjectSyncRepairTargets(context.Background(), emptyUID, []string{"present-node"}); err == nil {
 		t.Fatal("expected an error for an empty ServiceAccountAccess UID")
 	}
 
 	readerErr := errors.New("api reader unavailable")
 	controller.Reader = getErrorReader{Reader: fakeClient, err: readerErr}
-	if _, err := controller.getMissingObjectSyncNodes(context.Background(), acc, []string{"present-node"}); !errors.Is(err, readerErr) {
-		t.Fatalf("getMissingObjectSyncNodes error = %v, want wrapped %v", err, readerErr)
+	if _, err := controller.getObjectSyncRepairTargets(context.Background(), acc, []string{"present-node"}); !errors.Is(err, readerErr) {
+		t.Fatalf("getObjectSyncRepairTargets error = %v, want wrapped %v", err, readerErr)
 	}
 }
 
@@ -1489,6 +1521,15 @@ func TestObjectSyncDeletePredicateAndMapping(t *testing.T) {
 	if got := controller.mapObjectSyncFunc(context.Background(), objectSync); !reflect.DeepEqual(got, want) {
 		t.Fatalf("mapObjectSyncFunc = %v, want %v", got, want)
 	}
+	legacy := objectSync.DeepCopy()
+	legacy.Spec.ObjectAPIVersion = ""
+	legacy.Spec.ObjectKind = ""
+	if !p.Delete(event.DeleteEvent{Object: legacy}) {
+		t.Fatal("legacy ServiceAccountAccess ObjectSync delete event must trigger reconciliation")
+	}
+	if got := controller.mapObjectSyncFunc(context.Background(), legacy); !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy mapObjectSyncFunc = %v, want %v", got, want)
+	}
 	nonAccess := objectSync.DeepCopy()
 	nonAccess.Spec.ObjectKind = "Pod"
 	if p.Delete(event.DeleteEvent{Object: nonAccess}) {
@@ -1496,6 +1537,11 @@ func TestObjectSyncDeletePredicateAndMapping(t *testing.T) {
 	}
 	if got := controller.mapObjectSyncFunc(context.Background(), nonAccess); len(got) != 0 {
 		t.Fatalf("mapObjectSyncFunc returned requests for non-access ObjectSync: %v", got)
+	}
+	missingName := legacy.DeepCopy()
+	missingName.Spec.ObjectName = ""
+	if p.Delete(event.DeleteEvent{Object: missingName}) {
+		t.Fatal("legacy ObjectSync without an object name cannot be mapped")
 	}
 }
 
@@ -1626,6 +1672,41 @@ func TestServiceAccountAccessRepairEventOrderings(t *testing.T) {
 		}
 	}
 
+	t.Run("terminating ServiceAccount is never restored", func(t *testing.T) {
+		serviceAccount, pod, node, access := newObjects()
+		now := metav1.Now()
+		serviceAccount.DeletionTimestamp = &now
+		serviceAccount.Finalizers = []string{"test.kubeedge.io/hold"}
+		fakeClient := newClient(t, newScheme(t), serviceAccount, pod, node, access)
+		recorder := &recordingMessageLayer{}
+		controller := &Controller{Client: fakeClient, Reader: fakeClient, MessageLayer: recorder}
+		request := controllerruntime.Request{NamespacedName: client.ObjectKey{Namespace: namespace, Name: accessName}}
+
+		result, err := controller.Reconcile(context.Background(), request)
+		if err != nil {
+			t.Fatalf("terminating ServiceAccount reconcile returned error: %v", err)
+		}
+		if result != (controllerruntime.Result{}) {
+			t.Fatalf("terminating ServiceAccount reconcile result = %v, want empty", result)
+		}
+		assertMessage(t, recorder, model.DeleteOperation)
+		if err := fakeClient.Get(context.Background(), request.NamespacedName, &policyv1alpha1.ServiceAccountAccess{}); !apierror.IsNotFound(err) {
+			t.Fatalf("terminating ServiceAccount access delete error = %v, want NotFound", err)
+		}
+
+		recorder.messages = nil
+		result, err = controller.Reconcile(context.Background(), request)
+		if err != nil {
+			t.Fatalf("terminating ServiceAccount ensure returned error: %v", err)
+		}
+		if result != (controllerruntime.Result{}) || len(recorder.messages) != 0 {
+			t.Fatalf("terminating ServiceAccount ensure result/messages = %v/%d, want empty/0", result, len(recorder.messages))
+		}
+		if err := fakeClient.Get(context.Background(), request.NamespacedName, &policyv1alpha1.ServiceAccountAccess{}); !apierror.IsNotFound(err) {
+			t.Fatalf("terminating ServiceAccount restored access error = %v, want NotFound", err)
+		}
+	})
+
 	t.Run("ObjectSync delete before Node create restores deleted access", func(t *testing.T) {
 		serviceAccount, pod, node, access := newObjects()
 		fakeClient := newClient(t, newScheme(t), serviceAccount, pod, access)
@@ -1705,10 +1786,51 @@ func TestServiceAccountAccessRepairEventOrderings(t *testing.T) {
 		if err != nil {
 			t.Fatalf("missing ObjectSync reconcile returned error: %v", err)
 		}
-		if result.RequeueAfter != objectSyncRepairRequeueInterval {
-			t.Fatalf("missing ObjectSync result = %v, want requeueAfter %v", result, objectSyncRepairRequeueInterval)
+		if !result.Requeue {
+			t.Fatalf("missing ObjectSync result = %v, want rate-limited requeue", result)
 		}
 		assertMessage(t, recorder, model.InsertOperation)
+	})
+
+	t.Run("legacy ObjectSync spec is backfilled once", func(t *testing.T) {
+		for _, resourceVersion := range []string{"0", "1"} {
+			t.Run("object-resource-version-"+resourceVersion, func(t *testing.T) {
+				serviceAccount, pod, node, access := newObjects()
+				objectSync := newTestServiceAccountAccessObjectSync(access, nodeName, resourceVersion)
+				objectSync.Spec.ObjectAPIVersion = ""
+				objectSync.Spec.ObjectKind = ""
+				fakeClient := newClient(t, newScheme(t), serviceAccount, pod, node, access, objectSync)
+				recorder := &recordingMessageLayer{}
+				controller := &Controller{Client: fakeClient, Reader: fakeClient, MessageLayer: recorder}
+				request := controllerruntime.Request{NamespacedName: client.ObjectKey{Namespace: namespace, Name: accessName}}
+
+				result, err := controller.Reconcile(context.Background(), request)
+				if err != nil {
+					t.Fatalf("legacy ObjectSync reconcile returned error: %v", err)
+				}
+				if !result.Requeue {
+					t.Fatalf("legacy ObjectSync result = %v, want rate-limited requeue", result)
+				}
+				assertMessage(t, recorder, model.InsertOperation)
+
+				objectSync.Spec.ObjectAPIVersion = policyv1alpha1.SchemeGroupVersion.String()
+				objectSync.Spec.ObjectKind = serviceAccountAccessKind
+				if err := fakeClient.Update(context.Background(), objectSync); err != nil {
+					t.Fatalf("failed to simulate CloudHub ObjectSync backfill: %v", err)
+				}
+				recorder.messages = nil
+				result, err = controller.Reconcile(context.Background(), request)
+				if err != nil {
+					t.Fatalf("backfilled ObjectSync reconcile returned error: %v", err)
+				}
+				if result != (controllerruntime.Result{}) {
+					t.Fatalf("backfilled ObjectSync result = %v, want empty", result)
+				}
+				if len(recorder.messages) != 0 {
+					t.Fatalf("backfilled ObjectSync reconcile sent %d messages, want 0", len(recorder.messages))
+				}
+			})
+		}
 	})
 }
 
@@ -2026,7 +2148,7 @@ func TestSyncRules(t *testing.T) {
 			input: saa1.DeepCopy(),
 			obj: []client.Object{saa1.DeepCopy(), pod1.DeepCopy(), pod2.DeepCopy(), sa1.DeepCopy(), rb1.DeepCopy(),
 				crb1.DeepCopy(), cr1.DeepCopy(), role1.DeepCopy()},
-			reconcileResult: controllerruntime.Result{RequeueAfter: objectSyncRepairRequeueInterval},
+			reconcileResult: controllerruntime.Result{Requeue: true},
 			output: &policyv1alpha1.ServiceAccountAccess{ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace"},
 				Spec: policyv1alpha1.AccessSpec{
 					ServiceAccount:           *sa1.DeepCopy(),
@@ -2050,7 +2172,7 @@ func TestSyncRules(t *testing.T) {
 			input:                  saa1.DeepCopy(),
 			obj:                    []client.Object{saa1.DeepCopy(), pod1.DeepCopy(), sa1.DeepCopy(), rb1.DeepCopy(), crb1.DeepCopy(), cr1.DeepCopy(), role1.DeepCopy()},
 			missingObjectSyncNodes: []string{"my-node"},
-			reconcileResult:        controllerruntime.Result{RequeueAfter: objectSyncRepairRequeueInterval},
+			reconcileResult:        controllerruntime.Result{Requeue: true},
 			output:                 saa1.DeepCopy(),
 			msgOpr:                 []string{model.InsertOperation},
 			msgNodes:               []string{"my-node"},
@@ -2060,7 +2182,7 @@ func TestSyncRules(t *testing.T) {
 			input:                  saa1.DeepCopy(),
 			obj:                    []client.Object{saa1.DeepCopy(), pod1.DeepCopy(), pod2.DeepCopy(), sa1.DeepCopy(), rb1.DeepCopy(), crb1.DeepCopy(), cr1.DeepCopy(), role1.DeepCopy()},
 			missingObjectSyncNodes: []string{"my-node"},
-			reconcileResult:        controllerruntime.Result{RequeueAfter: objectSyncRepairRequeueInterval},
+			reconcileResult:        controllerruntime.Result{Requeue: true},
 			output: &policyv1alpha1.ServiceAccountAccess{ObjectMeta: metav1.ObjectMeta{Name: "sa1", Namespace: "my-namespace"},
 				Spec: policyv1alpha1.AccessSpec{
 					ServiceAccount:           *sa1.DeepCopy(),

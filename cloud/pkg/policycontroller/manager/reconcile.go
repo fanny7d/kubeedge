@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -17,10 +18,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apiserver/pkg/authentication/serviceaccount"
 	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	controllerconfig "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -36,11 +39,26 @@ import (
 )
 
 const (
-	podServiceAccountNameField      = "spec.serviceAccountName"
-	podNodeNameField                = "spec.nodeName"
-	serviceAccountAccessKind        = "ServiceAccountAccess"
-	objectSyncRepairRequeueInterval = 5 * time.Second
+	podServiceAccountNameField     = "spec.serviceAccountName"
+	podNodeNameField               = "spec.nodeName"
+	serviceAccountAccessKind       = "ServiceAccountAccess"
+	objectSyncRepairInitialBackoff = 5 * time.Second
+	objectSyncRepairMaximumBackoff = 5 * time.Minute
+	policyControllerRetryQPS       = 10
+	policyControllerRetryBurst     = 100
 )
+
+func newPolicyControllerRateLimiter() workqueue.TypedRateLimiter[controllerruntime.Request] {
+	return workqueue.NewTypedMaxOfRateLimiter(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[controllerruntime.Request](
+			objectSyncRepairInitialBackoff,
+			objectSyncRepairMaximumBackoff,
+		),
+		&workqueue.TypedBucketRateLimiter[controllerruntime.Request]{
+			Limiter: rate.NewLimiter(policyControllerRetryQPS, policyControllerRetryBurst),
+		},
+	)
+}
 
 type Controller struct {
 	client.Client
@@ -55,7 +73,7 @@ func (c *Controller) Reconcile(ctx context.Context, request controllerruntime.Re
 			return c.ensureServiceAccountAccess(ctx, request)
 		}
 		klog.Errorf("failed to get serviceaccountaccess %s/%s, %v", request.Namespace, request.Name, err)
-		return controllerruntime.Result{Requeue: true}, err
+		return controllerruntime.Result{}, err
 	}
 	if !acc.GetDeletionTimestamp().IsZero() {
 		return controllerruntime.Result{}, nil
@@ -73,20 +91,23 @@ func (c *Controller) ensureServiceAccountAccess(ctx context.Context, request con
 		if apierrors.IsNotFound(err) {
 			return controllerruntime.Result{}, nil
 		}
-		return controllerruntime.Result{Requeue: true}, fmt.Errorf("failed to get serviceaccount %s/%s while restoring access: %w",
+		return controllerruntime.Result{}, fmt.Errorf("failed to get serviceaccount %s/%s while restoring access: %w",
 			request.Namespace, request.Name, err)
+	}
+	if serviceAccount.DeletionTimestamp != nil {
+		return controllerruntime.Result{}, nil
 	}
 
 	access := newSaAccessObject(*serviceAccount)
 	nodes, err := getNodeListOfServiceAccountAccess(ctx, c.Reader, access)
 	if err != nil {
-		return controllerruntime.Result{Requeue: true}, err
+		return controllerruntime.Result{}, err
 	}
 	if len(nodes) == 0 {
 		return controllerruntime.Result{}, nil
 	}
 	if err := c.Client.Create(ctx, access); err != nil && !apierrors.IsAlreadyExists(err) {
-		return controllerruntime.Result{Requeue: true}, fmt.Errorf("failed to restore serviceaccountaccess %s/%s: %w",
+		return controllerruntime.Result{}, fmt.Errorf("failed to restore serviceaccountaccess %s/%s: %w",
 			access.Namespace, access.Name, err)
 	}
 	klog.Infof("restored serviceaccountaccess %s/%s for %d live edge nodes", access.Namespace, access.Name, len(nodes))
@@ -274,8 +295,11 @@ func (c *Controller) mapObjectSyncFunc(_ context.Context, object client.Object) 
 }
 
 func isServiceAccountAccessObjectSync(objectSync *reliablesyncsv1alpha1.ObjectSync) bool {
+	// Older CloudCore versions persisted ServiceAccountAccess ObjectSyncs with
+	// an empty kind. Mapping those delete events is safe because Reconcile later
+	// verifies the exact ObjectSync name derived from the live access object's UID.
 	return objectSync != nil &&
-		objectSync.Spec.ObjectKind == serviceAccountAccessKind &&
+		(objectSync.Spec.ObjectKind == serviceAccountAccessKind || objectSync.Spec.ObjectKind == "") &&
 		objectSync.Spec.ObjectName != ""
 }
 
@@ -379,6 +403,7 @@ func (c *Controller) SetupWithManager(ctx context.Context, mgr controllerruntime
 		return fmt.Errorf("failed to set ServiceAccountName field selector for manager, %v", err)
 	}
 	return controllerruntime.NewControllerManagedBy(mgr).
+		WithOptions(controllerconfig.Options{RateLimiter: newPolicyControllerRateLimiter()}).
 		For(&policyv1alpha1.ServiceAccountAccess{}).
 		Watches(&reliablesyncsv1alpha1.ObjectSync{}, handler.EnqueueRequestsFromMapFunc(c.mapObjectSyncFunc), builder.WithPredicates(objectSyncDeletePredicate())).
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(c.mapNodeFunc), builder.WithPredicates(edgeNodeCreatePredicate())).
@@ -445,31 +470,54 @@ func getNodeListOfServiceAccountAccess(ctx context.Context, reader client.Reader
 	return nodeList, nil
 }
 
-func (c *Controller) getMissingObjectSyncNodes(ctx context.Context, acc *policyv1alpha1.ServiceAccountAccess, nodes []string) ([]string, error) {
+type objectSyncRepairTargets struct {
+	nodes               []string
+	missingNodes        []string
+	incompleteSpecNodes []string
+}
+
+func objectSyncSpecNeedsBackfill(objectSync *reliablesyncsv1alpha1.ObjectSync) bool {
+	// A new snapshot lets CloudHub fill these legacy fields and then hand the
+	// resource-version retry back to SyncController. A complete ObjectSync with
+	// an empty or stale status is deliberately not retried from PolicyController.
+	return objectSync != nil &&
+		(objectSync.Spec.ObjectAPIVersion == "" ||
+			objectSync.Spec.ObjectKind == "" ||
+			objectSync.Spec.ObjectName == "")
+}
+
+func (c *Controller) getObjectSyncRepairTargets(ctx context.Context, acc *policyv1alpha1.ServiceAccountAccess, nodes []string) (objectSyncRepairTargets, error) {
+	targets := objectSyncRepairTargets{}
 	if len(nodes) == 0 {
-		return nil, nil
+		return targets, nil
 	}
 	if acc.UID == "" {
-		return nil, fmt.Errorf("serviceaccountaccess %s/%s has an empty UID", acc.Namespace, acc.Name)
+		return targets, fmt.Errorf("serviceaccountaccess %s/%s has an empty UID", acc.Namespace, acc.Name)
 	}
 
-	missing := make([]string, 0)
 	for _, node := range nodes {
 		name := synccontroller.BuildObjectSyncName(node, string(acc.UID))
 		objectSync := &reliablesyncsv1alpha1.ObjectSync{}
 		err := c.Reader.Get(ctx, client.ObjectKey{Namespace: acc.Namespace, Name: name}, objectSync)
 		if apierrors.IsNotFound(err) {
-			missing = append(missing, node)
+			targets.nodes = append(targets.nodes, node)
+			targets.missingNodes = append(targets.missingNodes, node)
 			continue
 		}
 		if err != nil {
-			return nil, fmt.Errorf("failed to get ObjectSync %s/%s: %w", acc.Namespace, name, err)
+			return targets, fmt.Errorf("failed to get ObjectSync %s/%s: %w", acc.Namespace, name, err)
 		}
 		if objectSync.DeletionTimestamp != nil {
-			missing = append(missing, node)
+			targets.nodes = append(targets.nodes, node)
+			targets.missingNodes = append(targets.missingNodes, node)
+			continue
+		}
+		if objectSyncSpecNeedsBackfill(objectSync) {
+			targets.nodes = append(targets.nodes, node)
+			targets.incompleteSpecNodes = append(targets.incompleteSpecNodes, node)
 		}
 	}
-	return missing, nil
+	return targets, nil
 }
 
 func intersectSlice(old, new []string) []string {
@@ -530,13 +578,13 @@ func (c *Controller) syncRules(ctx context.Context, acc *policyv1alpha1.ServiceA
 		copyObj := acc.DeepCopy()
 		if err := c.Client.Delete(ctx, copyObj); err != nil {
 			klog.Errorf("failed to delete serviceaccountaccess %s/%s, %v", copyObj.Namespace, copyObj.Name, err)
-			return controllerruntime.Result{Requeue: true}, err
+			return controllerruntime.Result{}, err
 		}
 		c.send2Edge(copyObj, copyObj.Status.NodeList, model.DeleteOperation)
 		return controllerruntime.Result{}, nil
 	} else if err != nil {
 		klog.Errorf("failed to get serviceaccount %s/%s, %v", acc.Namespace, acc.Spec.ServiceAccount.Name, err)
-		return controllerruntime.Result{Requeue: true}, err
+		return controllerruntime.Result{}, err
 	}
 	userInfo := serviceaccount.UserInfo(newSA.Namespace, newSA.Name, string(newSA.UID))
 	var currentAcc = &policyv1alpha1.ServiceAccountAccess{}
@@ -544,7 +592,7 @@ func (c *Controller) syncRules(ctx context.Context, acc *policyv1alpha1.ServiceA
 	nodes, err := getNodeListOfServiceAccountAccess(ctx, c.Reader, acc)
 	if err != nil {
 		klog.Errorf("failed to get node list of serviceaccountaccess %s/%s, %v", acc.Namespace, acc.Name, err)
-		return controllerruntime.Result{Requeue: true}, err
+		return controllerruntime.Result{}, err
 	}
 	currentAcc.Spec.ServiceAccount = *newSA
 	currentAcc.Spec.ServiceAccountUID = newSA.UID
@@ -558,7 +606,7 @@ func (c *Controller) syncRules(ctx context.Context, acc *policyv1alpha1.ServiceA
 		if len(nodes) == 0 {
 			if err = c.Client.Delete(ctx, acc); err != nil {
 				klog.Errorf("failed to delete serviceaccountaccess %s/%s, %v", acc.Namespace, acc.Name, err)
-				return controllerruntime.Result{Requeue: true}, err
+				return controllerruntime.Result{}, err
 			}
 			klog.V(4).Infof("delete serviceaccountaccess %s/%s", acc.Namespace, acc.Name)
 			c.send2Edge(acc, deleteNodes, model.DeleteOperation)
@@ -582,13 +630,13 @@ func (c *Controller) syncRules(ctx context.Context, acc *policyv1alpha1.ServiceA
 		acc.Spec = *currentAcc.Spec.DeepCopy()
 		if err := c.Client.Update(ctx, acc); err != nil {
 			klog.Errorf("failed to update serviceaccountaccess %s/%s, %v", acc.Namespace, acc.Name, err)
-			return controllerruntime.Result{Requeue: true}, err
+			return controllerruntime.Result{}, err
 		}
 		if !equality.Semantic.DeepEqual(acc.Status.NodeList, nodes) {
 			acc.Status.NodeList = append([]string{}, nodes...)
 			if err := c.Client.Status().Update(ctx, acc); err != nil {
 				klog.Errorf("failed to update serviceaccountaccess status %s/%s, %v", acc.Namespace, acc.Name, err)
-				return controllerruntime.Result{Requeue: true}, err
+				return controllerruntime.Result{}, err
 			}
 		}
 		c.send2Edge(acc, nodes, model.UpdateOperation)
@@ -600,27 +648,35 @@ func (c *Controller) syncRules(ctx context.Context, acc *policyv1alpha1.ServiceA
 			acc.Status.NodeList = append([]string{}, nodes...)
 			if err := c.Client.Status().Update(ctx, acc); err != nil {
 				klog.Errorf("failed to update serviceaccountaccess status %s/%s, %v", acc.Namespace, acc.Name, err)
-				return controllerruntime.Result{Requeue: true}, err
+				return controllerruntime.Result{}, err
 			}
 		}
 		if len(addNodes) != 0 {
 			c.send2Edge(acc, addNodes, model.InsertOperation)
 		}
 
-		missingObjectSyncNodes, err := c.getMissingObjectSyncNodes(ctx, acc, retainedNodes)
+		repairTargets, err := c.getObjectSyncRepairTargets(ctx, acc, retainedNodes)
 		if err != nil {
 			klog.Errorf("failed to check ObjectSync delivery state for serviceaccountaccess %s/%s, %v", acc.Namespace, acc.Name, err)
-			return controllerruntime.Result{Requeue: true}, err
+			return controllerruntime.Result{}, err
 		}
-		if len(missingObjectSyncNodes) != 0 {
+		if len(repairTargets.missingNodes) != 0 {
 			klog.Infof("repairing %d missing ObjectSync records for serviceaccountaccess %s/%s",
-				len(missingObjectSyncNodes), acc.Namespace, acc.Name)
+				len(repairTargets.missingNodes), acc.Namespace, acc.Name)
 			klog.V(4).Infof("missing ObjectSync targets for serviceaccountaccess %s/%s: %v",
-				acc.Namespace, acc.Name, missingObjectSyncNodes)
-			c.send2Edge(acc, missingObjectSyncNodes, model.InsertOperation)
+				acc.Namespace, acc.Name, repairTargets.missingNodes)
 		}
-		if len(addNodes) != 0 || len(missingObjectSyncNodes) != 0 {
-			return controllerruntime.Result{RequeueAfter: objectSyncRepairRequeueInterval}, nil
+		if len(repairTargets.incompleteSpecNodes) != 0 {
+			klog.Infof("backfilling %d incomplete ObjectSync specs for serviceaccountaccess %s/%s",
+				len(repairTargets.incompleteSpecNodes), acc.Namespace, acc.Name)
+			klog.V(4).Infof("incomplete ObjectSync spec targets for serviceaccountaccess %s/%s: %v",
+				acc.Namespace, acc.Name, repairTargets.incompleteSpecNodes)
+		}
+		if len(repairTargets.nodes) != 0 {
+			c.send2Edge(acc, repairTargets.nodes, model.InsertOperation)
+		}
+		if len(addNodes) != 0 || len(repairTargets.nodes) != 0 {
+			return controllerruntime.Result{Requeue: true}, nil
 		}
 	}
 	return controllerruntime.Result{}, nil
