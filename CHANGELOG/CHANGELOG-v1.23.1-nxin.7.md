@@ -5,20 +5,21 @@
 - Base: the immutable NXIN `v1.23.1-nxin.6` tag at commit
   `004104eeb8ceb194acca609fe1bec7402c566251`.
 - This release backports upstream KubeEdge commit
-  `7a58297e79807a56573b92a27c18d08d38f78fb0` and adds the bounded
-  PolicyController repair described below. It must not be built from `master`
-  or another moving branch.
-- `v1.23.1-nxin.7-rc.3` supersedes the immutable `rc.2` tag as a
-  CloudCore-only release candidate. EdgeCore, controller-manager, keadm,
-  offline archives, and installation images remain pinned to
-  `v1.23.1-nxin.6` and must not be rebuilt or rolled with this RC.
-  The differing NXIN suffixes identify component-specific patches; both sides
-  retain the same upstream KubeEdge `v1.23.1` API and cloud-edge protocol
-  baseline. Any future shared API, CloudHub/EdgeHub protocol, or edge-side
-  change must trigger a coordinated EdgeCore build and compatibility canary.
-- The rc.3 source line starts from the immutable rc.2 commit and deliberately
-  excludes the unrelated JSON patch and `cri.md` changes later merged into the
-  previous release branch.
+  `7a58297e79807a56573b92a27c18d08d38f78fb0`, adds the bounded
+  PolicyController repair described below, preserves JSON patch operation value
+  types, and fixes EdgeCore offline startup and reconnect behavior. It must not
+  be built from `master` or another moving branch.
+- `v1.23.1-nxin.7-rc.4` supersedes the immutable `rc.3` tag and restores one
+  unified `.7` source line for CloudCore and EdgeCore. It starts from the
+  immutable `rc.3` commit, includes the selected JSON patch commit from the
+  former release branch, and then applies the two EdgeCore fixes. The local
+  `.8-rc.1` and `.8-rc.2` tags were development candidates based directly on
+  `.6`; they are not part of this release and must not be published.
+- Deployment remains staged by component. The EdgeCore rc.4 canary does not
+  require replacing the already validated CloudCore rc.3 deployment because
+  the new runtime fixes are edge-side only. Before the final `.7` release, all
+  shipped components and offline installation artifacts must be rebuilt from
+  the same immutable final tag and pass their component-specific gates.
 
 ## Root cause
 
@@ -58,6 +59,16 @@ single-worker PolicyController. Node-create mapping also performed a direct Pod
 list in an event mapper, where a transient failure could not be retried. Finally,
 Role and ClusterRole reads used APIReader without matching chart RBAC, and a
 failed rule read could be mistaken for a valid partial authorization snapshot.
+
+When EdgeCore started without a CloudCore connection, MetaServer ignored its
+already-provisioned CA and serving certificate and waited only for the live
+connection. The wait had a four-minute startup timeout, and MetaServer handled
+that timeout with `panic`. Systemd then restarted the entire EdgeCore process
+every four minutes even though its cached credentials were still valid.
+
+The optional EdgeStream tunnel also retried CloudCore every two seconds for the
+entire offline period and logged each failed dial twice. It did not cause the
+four-minute restart, but it created an unnecessary connection and log storm.
 
 ## Fix
 
@@ -103,38 +114,73 @@ This repair is cluster-wide. A named edge node can be used as the first
 acceptance probe, but it is not an allowlist and does not bound the repair to
 that node.
 
-## Verification gates for v1.23.1-nxin.7-rc.3
+### JSON patch value preservation
 
-1. Pass PolicyController unit and race tests, including exact current-UID
+- Preserve the original JSON value type for add, replace, and test operations
+  instead of converting every value to a string.
+- Cover strings, numbers, booleans, objects, arrays, and null in unit tests.
+
+### EdgeCore offline startup
+
+- Validate the cached Kubernetes CA and MetaServer serving certificate before
+  waiting for CloudCore. Validation includes the trust chain, validity period,
+  exact node identity, `system:nodes` organization, server-auth usage, and all
+  configured MetaServer IP SANs.
+- Start MetaServer immediately from valid cached credentials while offline.
+- If no trustworthy cached credentials exist, keep only MetaServer waiting on
+  the EdgeCore lifecycle context. A temporary CloudCore outage no longer
+  returns the old four-minute timeout or terminates EdgeCore.
+- After connectivity returns, fetch and atomically persist a valid CA. An
+  invalid or incompatible replacement cannot overwrite the CA that verifies
+  the current serving certificate.
+- Preserve explicit failure for permanent local setup or configuration errors;
+  the change is limited to cloud-connectivity and certificate-readiness waits.
+
+### EdgeStream reconnect backoff
+
+- Reconnect with a cancelable exponential delay of 2, 4, 8, 16, and 30
+  seconds, capped at 30 seconds with 20 percent jitter.
+- Reset the next delay to two seconds only after a tunnel session remains
+  established for at least one minute. Short-lived sessions retain the
+  accumulated delay and cannot create a tight loop.
+- Emit one warning per unavailable endpoint attempt instead of two errors, and
+  cancel a pending delay immediately during EdgeCore shutdown.
+
+## Verification gates for v1.23.1-nxin.7-rc.4
+
+1. Verify that the candidate is a clean, linear descendant of the immutable
+   rc.3 tag and contains only the selected JSON patch change, the two EdgeCore
+   fixes, their tests, and this release-note consolidation.
+2. Pass PolicyController unit and race tests, including exact current-UID
    ObjectSync lookup, old-UID rejection, in-flight handling, event predicate
    filtering, exact legacy delete UID classification, retryable Node mapping,
    Pod status filtering, terminating-ServiceAccount loop prevention, legacy
    empty-spec backfill, rule-read failure preservation, bounded retry, and exact
    message targets.
-2. Pass SyncController and CloudHub regression tests and compile CloudCore for
-   Linux/amd64.
-3. Build and push only the CloudCore Linux/amd64 image from a clean checkout of
-   the immutable `v1.23.1-nxin.7-rc.3` tag. Record and deploy the OCI index
-   digest rather than a mutable tag or only a platform-manifest digest.
-4. Roll the three CloudCore replicas with at least two continuously Ready,
-   preserve the Service/NLB identity and Secret checksum, and allow at most one
-   PolicyController Lease transition.
-5. Use `asset-605047636244` and its exact Node UID as the first probe. Within
-   60 seconds of the new leader becoming active, require all five expected
-   ServiceAccountAccess ObjectSync records to exist; within 120 seconds require
-   every non-empty object resource version to equal its live source resource
-   version. The six pre-existing incomplete records on `plus-17819320948` and
-   `plus-497668035582` must gain complete specs and converge without deleting
-   and recreating already-correct records.
-6. Preserve the already-correct ObjectSync UID, the target Node UID and Ready
-   condition, all five Pod readiness states, and all container restart counts.
-   Observe CloudCore and the PolicyController Lease for at least 15 minutes and
-   reject new related error, warning, or fatal logs.
+3. Pass SyncController, CloudHub, and JSON patch regression tests; compile
+   CloudCore for Linux/amd64 from the integrated source without deploying it.
+4. Pass focused MetaServer certificate/server and EdgeStream unit tests, race
+   tests, `go vet`, and an ordinary Linux/arm64 build using the repository's
+   pinned Go 1.23 build image.
+5. Build EdgeCore from a clean checkout of the immutable rc.4 tag. On the
+   authorized canary, record the old binary hash/version, boot ID, EdgeCore PID,
+   and systemd restart counter; preserve a verified `.6` rollback binary.
+6. Block only the resolved CloudCore TCP endpoints while preserving SSH and
+   all other networking. Restart EdgeCore and require MetaServer to report that
+   it used valid cached credentials. Observe longer than the old four-minute
+   failure window: EdgeCore must retain one PID and restart count, with no
+   `wait for CA ready` panic. EdgeStream retries must grow to the 30-second cap.
+7. Restore CloudCore connectivity and require EdgeHub and EdgeStream to recover
+   without another EdgeCore restart. Do not use business-container health as a
+   pass condition for this narrowly scoped EdgeCore gate.
+8. In the final field test, cold-start the device while physically offline,
+   observe the same stability gate, reconnect the cable, and verify recovery.
 
 ## Rollback
 
-Roll CloudCore back to the digest-pinned `rc.2` Helm revision that preceded
-`rc.3`, without replacing the Service, NLB, or Secret. Newly repaired
-ObjectSync records are compatible with the previous CloudCore and should not
-be deleted during rollback. EdgeCore and controller-manager remain on `.6`
-throughout, so they require no rollback action.
+For the EdgeCore rc.4 canary, atomically restore the preserved
+`v1.23.1-nxin.6` EdgeCore binary and restart only the EdgeCore service. Remove
+temporary CloudCore-only firewall rules before judging reconnect behavior.
+CloudCore remains on the previously accepted rc.3 image, so this canary does
+not require a CloudCore rollback. Its existing digest-pinned rc.2 Helm rollback
+path remains unchanged.
