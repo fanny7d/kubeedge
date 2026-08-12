@@ -32,6 +32,21 @@ credentials were still valid.
 - Preserve explicit failure for permanent local setup/configuration errors;
   the change is limited to cloud-connectivity and certificate-readiness waits.
 
+## EdgeStream reconnect backoff
+
+The optional EdgeStream tunnel previously retried CloudCore every two seconds
+for the entire offline period and logged each failed dial twice. It did not
+cause the four-minute process restart, but it created an unnecessary connection
+and log storm while an edge node was expected to operate offline.
+
+- Reconnect now uses a cancelable exponential delay of 2, 4, 8, 16, and 30
+  seconds, capped at 30 seconds with 20 percent jitter.
+- A tunnel session that remains established for at least one minute resets the
+  next reconnect delay to two seconds; short-lived connections retain the
+  accumulated delay and cannot create a tight loop.
+- An unavailable CloudCore endpoint produces one warning per attempt instead
+  of two error records. EdgeCore shutdown cancels a pending delay immediately.
+
 ## Required acceptance gates
 
 1. Pass the focused MetaServer certificate and server unit tests, race tests,
@@ -48,7 +63,9 @@ credentials were still valid.
    no `wait for CA ready` panic may occur.
 5. Restore CloudCore connectivity and require EdgeHub sessions to reconnect
    without another EdgeCore restart.
-6. In the final field test, cold-start the device while physically offline,
+6. During isolation, verify EdgeStream retry intervals grow to the 30-second
+   cap and no longer produce a fixed two-second connection-error loop.
+7. In the final field test, cold-start the device while physically offline,
    observe the same stability gate, reconnect the cable, and verify recovery.
 
 ## Rollback
