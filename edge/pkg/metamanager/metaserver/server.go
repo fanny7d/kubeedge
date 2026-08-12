@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -241,8 +242,21 @@ func (ls *MetaServer) startHTTPSServer(addr string, stopChan <-chan struct{}) {
 
 func (ls *MetaServer) Start(stopChan <-chan struct{}) {
 	if kefeatures.DefaultFeatureGate.Enabled(kefeatures.RequireAuthorization) {
-		err := ls.prepareServer()
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-stopChan:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+
+		err := ls.prepareServer(ctx)
 		if err != nil {
+			cancel()
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			panic(err)
 		}
 		go ls.startHTTPSServer(metaserverconfig.Config.Server, stopChan)
@@ -330,7 +344,7 @@ func BuildHandlerChain(handler http.Handler, ls *MetaServer) http.Handler {
 	return handler
 }
 
-func (ls *MetaServer) prepareServer() error {
+func (ls *MetaServer) prepareServer(ctx context.Context) error {
 	err := setupDummyInterface()
 	if err != nil {
 		return fmt.Errorf("setup dummy interface err: %v", err)
@@ -349,18 +363,23 @@ func (ls *MetaServer) prepareServer() error {
 		return fmt.Errorf("failed to initialize certificate manager: %v", err)
 	}
 
-	err = certificateManager.WaitForCAReady()
+	err = certificateManager.WaitForCAReady(ctx)
 	if err != nil {
 		return fmt.Errorf("wait for CA ready failed: %v", err)
 	}
 
 	certificateManager.Start()
-	err = certificateManager.WaitForCertReady()
+	err = certificateManager.WaitForCertReady(ctx)
 	if err != nil {
 		return fmt.Errorf("wait for cert ready failed: %v", err)
 	}
 
 	ls.serverCeriticateManager = certificateManager
+	go func() {
+		if err := certificateManager.RefreshCAWhenConnected(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			klog.Errorf("[metaserver] refresh cached Kubernetes CA: %v", err)
+		}
+	}()
 	return nil
 }
 
