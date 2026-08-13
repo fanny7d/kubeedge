@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/api/apis/componentconfig/edgecore/v1alpha2"
@@ -35,6 +36,15 @@ import (
 	"github.com/kubeedge/kubeedge/pkg/features"
 	"github.com/kubeedge/kubeedge/pkg/stream"
 	"github.com/kubeedge/kubeedge/pkg/util"
+)
+
+const (
+	edgeStreamInitialReconnectDelay = 2 * time.Second
+	edgeStreamMaxReconnectDelay     = 30 * time.Second
+	edgeStreamStableSessionDuration = time.Minute
+	edgeStreamReconnectFactor       = 2.0
+	edgeStreamReconnectJitter       = 0.2
+	edgeStreamReconnectSteps        = 5
 )
 
 type edgestream struct {
@@ -101,24 +111,58 @@ func (e *edgestream) Start() {
 		Certificates:       []tls.Certificate{cert},
 	}
 
-	ticker := time.NewTicker(time.Second * 2)
-	defer ticker.Stop()
-
+	backoff := newEdgeStreamReconnectBackoff(edgeStreamReconnectJitter)
 	for {
-		select {
-		case <-beehiveContext.Done():
+		delay := backoff.Step()
+		if !waitForEdgeStreamReconnect(beehiveContext.Done(), delay) {
 			return
-		case <-ticker.C:
-			err := e.TLSClientConnect(serverURL, tlsConfig)
-			if err != nil {
-				klog.Errorf("TLSClientConnect error %v", err)
-			}
 		}
+
+		started := time.Now()
+		err := e.TLSClientConnect(serverURL, tlsConfig)
+		sessionDuration := time.Since(started)
+		if resetEdgeStreamReconnectBackoff(&backoff, sessionDuration) {
+			klog.V(2).Infof("Reset EdgeStream reconnect backoff after a stable session lasting %s", sessionDuration.Round(time.Second))
+		}
+		if err != nil {
+			klog.Warningf("EdgeStream connection ended after %s: %v; next retry base delay is %s", sessionDuration.Round(time.Second), err, backoff.Duration)
+			continue
+		}
+		klog.Warningf("EdgeStream connection ended without an error after %s; next retry base delay is %s", sessionDuration.Round(time.Second), backoff.Duration)
+	}
+}
+
+func newEdgeStreamReconnectBackoff(jitter float64) wait.Backoff {
+	return wait.Backoff{
+		Duration: edgeStreamInitialReconnectDelay,
+		Factor:   edgeStreamReconnectFactor,
+		Jitter:   jitter,
+		Steps:    edgeStreamReconnectSteps,
+		Cap:      edgeStreamMaxReconnectDelay,
+	}
+}
+
+func resetEdgeStreamReconnectBackoff(backoff *wait.Backoff, sessionDuration time.Duration) bool {
+	if sessionDuration < edgeStreamStableSessionDuration {
+		return false
+	}
+	*backoff = newEdgeStreamReconnectBackoff(backoff.Jitter)
+	return true
+}
+
+func waitForEdgeStreamReconnect(stop <-chan struct{}, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-stop:
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
 func (e *edgestream) TLSClientConnect(url url.URL, tlsConfig *tls.Config) error {
-	klog.Info("Start a new tunnel stream connection ...")
+	klog.V(2).Info("Start a new tunnel stream connection ...")
 
 	// If the node IP address is not specified in the configuration file,
 	// the node IP address is reacquired each time the tunnel stream is reconnected
@@ -144,9 +188,11 @@ func (e *edgestream) TLSClientConnect(url url.URL, tlsConfig *tls.Config) error 
 
 	con, _, err := dial.Dial(url.String(), header)
 	if err != nil {
-		klog.Errorf("dial %v error %v", url.String(), err)
-		return err
+		return fmt.Errorf("dial %s: %w", url.String(), err)
 	}
 	session := NewTunnelSession(con)
-	return session.Serve()
+	if err := session.Serve(); err != nil {
+		return fmt.Errorf("serve tunnel session: %w", err)
+	}
+	return nil
 }

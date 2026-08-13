@@ -39,6 +39,29 @@ func (r getErrorReader) Get(context.Context, client.ObjectKey, client.Object, ..
 	return r.err
 }
 
+type listErrorClient struct {
+	client.Client
+	err error
+}
+
+func (c listErrorClient) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return c.err
+}
+
+type roleGetErrorReader struct {
+	client.Reader
+	err error
+}
+
+func (r roleGetErrorReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, opts ...client.GetOption) error {
+	switch object.(type) {
+	case *rbacv1.Role, *rbacv1.ClusterRole:
+		return r.err
+	default:
+		return r.Reader.Get(ctx, key, object, opts...)
+	}
+}
+
 type recordingMessageLayer struct {
 	messages []model.Message
 }
@@ -1492,13 +1515,24 @@ func TestGetObjectSyncRepairTargets(t *testing.T) {
 
 	readerErr := errors.New("api reader unavailable")
 	controller.Reader = getErrorReader{Reader: fakeClient, err: readerErr}
-	if _, err := controller.getObjectSyncRepairTargets(context.Background(), acc, []string{"present-node"}); !errors.Is(err, readerErr) {
+	if _, err := controller.getObjectSyncRepairTargets(context.Background(), acc, []string{"present-node"}); err != nil {
+		t.Fatalf("cached ObjectSync lookup unexpectedly used APIReader: %v", err)
+	}
+	if _, err := controller.getObjectSyncRepairTargets(context.Background(), acc, []string{"missing-node"}); !errors.Is(err, readerErr) {
 		t.Fatalf("getObjectSyncRepairTargets error = %v, want wrapped %v", err, readerErr)
 	}
 }
 
 func TestObjectSyncDeletePredicateAndMapping(t *testing.T) {
-	controller := &Controller{}
+	scheme := runtime.NewScheme()
+	if err := policyv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add policy scheme: %v", err)
+	}
+	access := &policyv1alpha1.ServiceAccountAccess{ObjectMeta: metav1.ObjectMeta{
+		Name: "default", Namespace: "test-namespace", UID: types.UID("access-uid"),
+	}}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(access).Build()
+	controller := &Controller{Client: fakeClient, Reader: fakeClient}
 	objectSync := &reliablesyncsv1alpha1.ObjectSync{
 		ObjectMeta: metav1.ObjectMeta{Name: "edge-node.access-uid", Namespace: "test-namespace"},
 		Spec: reliablesyncsv1alpha1.ObjectSyncSpec{
@@ -1530,6 +1564,16 @@ func TestObjectSyncDeletePredicateAndMapping(t *testing.T) {
 	if got := controller.mapObjectSyncFunc(context.Background(), legacy); !reflect.DeepEqual(got, want) {
 		t.Fatalf("legacy mapObjectSyncFunc = %v, want %v", got, want)
 	}
+	oldLegacy := legacy.DeepCopy()
+	oldLegacy.Name = "edge-node.old-access-uid"
+	if got := controller.mapObjectSyncFunc(context.Background(), oldLegacy); len(got) != 0 {
+		t.Fatalf("legacy ObjectSync with an old UID returned requests: %v", got)
+	}
+	unrelatedLegacy := legacy.DeepCopy()
+	unrelatedLegacy.Spec.ObjectName = "workload"
+	if got := controller.mapObjectSyncFunc(context.Background(), unrelatedLegacy); len(got) != 0 {
+		t.Fatalf("unrelated legacy ObjectSync returned requests: %v", got)
+	}
 	nonAccess := objectSync.DeepCopy()
 	nonAccess.Spec.ObjectKind = "Pod"
 	if p.Delete(event.DeleteEvent{Object: nonAccess}) {
@@ -1543,6 +1587,25 @@ func TestObjectSyncDeletePredicateAndMapping(t *testing.T) {
 	if p.Delete(event.DeleteEvent{Object: missingName}) {
 		t.Fatal("legacy ObjectSync without an object name cannot be mapped")
 	}
+	missingUID := legacy.DeepCopy()
+	missingUID.Name = "edge-node"
+	if p.Delete(event.DeleteEvent{Object: missingUID}) {
+		t.Fatal("legacy ObjectSync without a source UID cannot be mapped")
+	}
+
+	readerErr := errors.New("cache unavailable")
+	retryController := &Controller{Reader: getErrorReader{Reader: fakeClient, err: readerErr}}
+	retryRequests := retryController.mapObjectSyncFunc(context.Background(), legacy)
+	if len(retryRequests) != 1 {
+		t.Fatalf("legacy cache error mapping = %v, want one retry request", retryRequests)
+	}
+	objectName, objectUID, ok := legacyObjectSyncFromRetryRequest(retryRequests[0])
+	if !ok || objectName != access.Name || objectUID != string(access.UID) {
+		t.Fatalf("legacy retry request decoded as %q/%q/%v", objectName, objectUID, ok)
+	}
+	if result, err := retryController.Reconcile(context.Background(), retryRequests[0]); !errors.Is(err, readerErr) || result != (controllerruntime.Result{}) {
+		t.Fatalf("legacy retry result/error = %v/%v, want empty/%v", result, err, readerErr)
+	}
 }
 
 func TestEdgeNodeCreatePredicateAndMapping(t *testing.T) {
@@ -1550,17 +1613,21 @@ func TestEdgeNodeCreatePredicateAndMapping(t *testing.T) {
 	if err := v1.AddToScheme(scheme); err != nil {
 		t.Fatalf("failed to add core scheme: %v", err)
 	}
+	if err := policyv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add policy scheme: %v", err)
+	}
 	pods := []client.Object{
 		&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-a", Namespace: "ns-a"}, Spec: v1.PodSpec{NodeName: "edge-node", ServiceAccountName: "default"}},
 		&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-b", Namespace: "ns-a"}, Spec: v1.PodSpec{NodeName: "edge-node", ServiceAccountName: "default"}},
 		&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod-c", Namespace: "ns-b"}, Spec: v1.PodSpec{NodeName: "edge-node", ServiceAccountName: "agent"}},
 		&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "other-node", Namespace: "ns-c"}, Spec: v1.PodSpec{NodeName: "other-node", ServiceAccountName: "default"}},
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pods...).WithIndex(&v1.Pod{}, podNodeNameField, func(object client.Object) []string {
+	edgeNode := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "edge-node", Labels: map[string]string{"node-role.kubernetes.io/edge": ""}}}
+	objects := append(append([]client.Object(nil), pods...), edgeNode)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithIndex(&v1.Pod{}, podNodeNameField, func(object client.Object) []string {
 		return []string{object.(*v1.Pod).Spec.NodeName}
 	}).Build()
 	controller := &Controller{Client: fakeClient, Reader: fakeClient}
-	edgeNode := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "edge-node", Labels: map[string]string{"node-role.kubernetes.io/edge": ""}}}
 	requests := controller.mapNodeFunc(context.Background(), edgeNode)
 	want := []controllerruntime.Request{
 		{NamespacedName: client.ObjectKey{Namespace: "ns-a", Name: "default"}},
@@ -1590,6 +1657,44 @@ func TestEdgeNodeCreatePredicateAndMapping(t *testing.T) {
 	}
 	if p.Delete(event.DeleteEvent{Object: edgeNode}) {
 		t.Fatal("node delete event must be handled through ObjectSync deletion, not the Node watch")
+	}
+
+	podPredicate := controller.podEventPredicate(context.Background())
+	oldPod := pods[0].(*v1.Pod)
+	if !podPredicate.Create(event.CreateEvent{Object: oldPod}) {
+		t.Fatal("edge Pod create event must trigger reconciliation")
+	}
+	statusOnly := oldPod.DeepCopy()
+	statusOnly.Status.Phase = v1.PodRunning
+	if podPredicate.Update(event.UpdateEvent{ObjectOld: oldPod, ObjectNew: statusOnly}) {
+		t.Fatal("Pod status-only update must not trigger reconciliation")
+	}
+	deletingPod := oldPod.DeepCopy()
+	now := metav1.Now()
+	deletingPod.DeletionTimestamp = &now
+	if !podPredicate.Update(event.UpdateEvent{ObjectOld: oldPod, ObjectNew: deletingPod}) {
+		t.Fatal("Pod deletion transition must trigger reconciliation")
+	}
+	if podPredicate.Generic(event.GenericEvent{Object: oldPod}) {
+		t.Fatal("Pod generic event must not trigger reconciliation")
+	}
+
+	listErr := errors.New("pod cache unavailable")
+	failingClient := listErrorClient{Client: fakeClient, err: listErr}
+	retryController := &Controller{Client: failingClient, Reader: failingClient}
+	retryRequests := retryController.mapNodeFunc(context.Background(), edgeNode)
+	if len(retryRequests) != 1 {
+		t.Fatalf("Node list error mapping = %v, want one retry request", retryRequests)
+	}
+	if nodeName, ok := nodeNameFromRetryRequest(retryRequests[0]); !ok || nodeName != edgeNode.Name {
+		t.Fatalf("Node retry request decoded as %q/%v", nodeName, ok)
+	}
+	if result, err := retryController.Reconcile(context.Background(), retryRequests[0]); !errors.Is(err, listErr) || result != (controllerruntime.Result{}) {
+		t.Fatalf("Node retry result/error = %v/%v, want empty/%v", result, err, listErr)
+	}
+	retryController.Reader = fakeClient
+	if result, err := retryController.Reconcile(context.Background(), retryRequests[0]); err != nil || result != (controllerruntime.Result{}) {
+		t.Fatalf("recovered Node retry result/error = %v/%v, want empty/nil", result, err)
 	}
 }
 
@@ -1832,6 +1937,74 @@ func TestServiceAccountAccessRepairEventOrderings(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestRuleReadErrorDoesNotOverwriteAccess(t *testing.T) {
+	const namespace = "test-namespace"
+	scheme := runtime.NewScheme()
+	for name, add := range map[string]func(*runtime.Scheme) error{
+		"core":   v1.AddToScheme,
+		"rbac":   rbacv1.AddToScheme,
+		"policy": policyv1alpha1.AddToScheme,
+	} {
+		if err := add(scheme); err != nil {
+			t.Fatalf("failed to add %s scheme: %v", name, err)
+		}
+	}
+	serviceAccount := &v1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name: "default", Namespace: namespace, UID: types.UID("service-account-uid"),
+	}}
+	clusterRole := &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "reader"}}
+	clusterRoleBinding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "reader"},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "ClusterRole",
+			Name:     clusterRole.Name,
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind: rbacv1.ServiceAccountKind, Name: serviceAccount.Name, Namespace: namespace,
+		}},
+	}
+	access := &policyv1alpha1.ServiceAccountAccess{
+		ObjectMeta: metav1.ObjectMeta{Name: serviceAccount.Name, Namespace: namespace, UID: types.UID("access-uid")},
+		Spec: policyv1alpha1.AccessSpec{
+			ServiceAccount:    *serviceAccount.DeepCopy(),
+			ServiceAccountUID: serviceAccount.UID,
+			AccessClusterRoleBinding: []policyv1alpha1.AccessClusterRoleBinding{{
+				ClusterRoleBinding: *clusterRoleBinding.DeepCopy(),
+				Rules:              []rbacv1.PolicyRule{{Verbs: []string{"get"}, Resources: []string{"pods"}}},
+			}},
+		},
+	}
+	originalSpec := access.Spec.DeepCopy()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(serviceAccount, clusterRole, clusterRoleBinding, access).
+		WithStatusSubresource(&policyv1alpha1.ServiceAccountAccess{}).
+		Build()
+	readerErr := errors.New("clusterrole get forbidden")
+	recorder := &recordingMessageLayer{}
+	controller := &Controller{
+		Client:       fakeClient,
+		Reader:       roleGetErrorReader{Reader: fakeClient, err: readerErr},
+		MessageLayer: recorder,
+	}
+	request := controllerruntime.Request{NamespacedName: client.ObjectKey{Namespace: namespace, Name: serviceAccount.Name}}
+	result, err := controller.Reconcile(context.Background(), request)
+	if !errors.Is(err, readerErr) || result != (controllerruntime.Result{}) {
+		t.Fatalf("rule read result/error = %v/%v, want empty/%v", result, err, readerErr)
+	}
+	persisted := &policyv1alpha1.ServiceAccountAccess{}
+	if err := fakeClient.Get(context.Background(), request.NamespacedName, persisted); err != nil {
+		t.Fatalf("failed to get persisted access: %v", err)
+	}
+	if !reflect.DeepEqual(&persisted.Spec, originalSpec) {
+		t.Fatalf("rule read error changed access spec: got %#v, want %#v", persisted.Spec, *originalSpec)
+	}
+	if len(recorder.messages) != 0 {
+		t.Fatalf("rule read error sent %d messages, want 0", len(recorder.messages))
+	}
 }
 
 func TestSyncRules(t *testing.T) {
