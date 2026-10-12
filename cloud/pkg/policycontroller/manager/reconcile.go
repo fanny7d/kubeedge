@@ -2,9 +2,11 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -46,6 +48,8 @@ const (
 	objectSyncRepairMaximumBackoff = 5 * time.Minute
 	policyControllerRetryQPS       = 10
 	policyControllerRetryBurst     = 100
+	rbacResyncRequestName          = "__policycontroller_rbac_resync__"
+	nodeRetryRequestPrefix         = "__policycontroller_node__/"
 )
 
 func newPolicyControllerRateLimiter() workqueue.TypedRateLimiter[controllerruntime.Request] {
@@ -67,6 +71,12 @@ type Controller struct {
 }
 
 func (c *Controller) Reconcile(ctx context.Context, request controllerruntime.Request) (controllerruntime.Result, error) {
+	if request.Namespace == "" && request.Name == rbacResyncRequestName {
+		return c.reconcileRBAC(ctx)
+	}
+	if request.Namespace == "" && strings.HasPrefix(request.Name, nodeRetryRequestPrefix) {
+		return c.reconcileNodeRetry(ctx, strings.TrimPrefix(request.Name, nodeRetryRequestPrefix))
+	}
 	acc := &policyv1alpha1.ServiceAccountAccess{}
 	if err := c.Reader.Get(ctx, request.NamespacedName, acc); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -79,6 +89,67 @@ func (c *Controller) Reconcile(ctx context.Context, request controllerruntime.Re
 		return controllerruntime.Result{}, nil
 	}
 	return c.syncRules(ctx, acc)
+}
+
+// RBAC events share one queue key. API reads happen here, where failures are
+// retried, instead of in event predicates/mappers that can silently lose events.
+func (c *Controller) reconcileRBAC(ctx context.Context) (controllerruntime.Result, error) {
+	accesses := &policyv1alpha1.ServiceAccountAccessList{}
+	if err := c.Reader.List(ctx, accesses); err != nil {
+		return controllerruntime.Result{}, fmt.Errorf("failed to list serviceaccountaccess for RBAC resync: %w", err)
+	}
+	var failures []error
+	requeue := false
+	for i := range accesses.Items {
+		acc := &accesses.Items[i]
+		if acc.DeletionTimestamp != nil {
+			continue
+		}
+		result, err := c.syncRules(ctx, acc)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("failed to sync RBAC for %s/%s: %w", acc.Namespace, acc.Name, err))
+		}
+		requeue = requeue || result.Requeue || result.RequeueAfter > 0
+	}
+	return controllerruntime.Result{Requeue: requeue}, errors.Join(failures...)
+}
+
+func mapRBACEvent(context.Context, client.Object) []controllerruntime.Request {
+	return []controllerruntime.Request{{NamespacedName: client.ObjectKey{Name: rbacResyncRequestName}}}
+}
+
+// Controller-owned access objects use the ServiceAccount name. Enqueue without
+// API calls: Reconcile validates live SA/Pod/Node membership and retries errors.
+func mapPodEvent(_ context.Context, object client.Object) []controllerruntime.Request {
+	pod, ok := object.(*corev1.Pod)
+	if !ok || pod == nil || pod.Spec.NodeName == "" || pod.Spec.ServiceAccountName == "" {
+		return nil
+	}
+	return []controllerruntime.Request{{NamespacedName: client.ObjectKey{Namespace: pod.Namespace, Name: pod.Spec.ServiceAccountName}}}
+}
+
+func mapServiceAccountEvent(_ context.Context, object client.Object) []controllerruntime.Request {
+	sa, ok := object.(*corev1.ServiceAccount)
+	if !ok || sa == nil {
+		return nil
+	}
+	return []controllerruntime.Request{{NamespacedName: client.ObjectKeyFromObject(sa)}}
+}
+
+func podEventPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldPod, oldOK := e.ObjectOld.(*corev1.Pod)
+			newPod, newOK := e.ObjectNew.(*corev1.Pod)
+			if !oldOK || !newOK || oldPod == nil || newPod == nil {
+				return false
+			}
+			return oldPod.UID != newPod.UID ||
+				oldPod.Spec.NodeName != newPod.Spec.NodeName ||
+				oldPod.Spec.ServiceAccountName != newPod.Spec.ServiceAccountName ||
+				(oldPod.DeletionTimestamp == nil) != (newPod.DeletionTimestamp == nil)
+		},
+	}
 }
 
 // ensureServiceAccountAccess restores a controller-owned access object when a
@@ -308,10 +379,18 @@ func (c *Controller) mapNodeFunc(ctx context.Context, object client.Object) []co
 	if !ok {
 		return nil
 	}
-	podList := &corev1.PodList{}
-	if err := c.Reader.List(ctx, podList, client.MatchingFields{podNodeNameField: node.Name}); err != nil {
+	requests, err := c.requestsForNode(ctx, node.Name)
+	if err != nil {
 		klog.Errorf("failed to list pods on edge node %s, %v", node.Name, err)
-		return nil
+		return []controllerruntime.Request{{NamespacedName: client.ObjectKey{Name: nodeRetryRequestPrefix + node.Name}}}
+	}
+	return requests
+}
+
+func (c *Controller) requestsForNode(ctx context.Context, nodeName string) ([]controllerruntime.Request, error) {
+	podList := &corev1.PodList{}
+	if err := c.Reader.List(ctx, podList, client.MatchingFields{podNodeNameField: nodeName}); err != nil {
+		return nil, err
 	}
 
 	requestSet := make(map[client.ObjectKey]struct{})
@@ -333,7 +412,24 @@ func (c *Controller) mapNodeFunc(ctx context.Context, object client.Object) []co
 		}
 		return requests[i].Namespace < requests[j].Namespace
 	})
-	return requests
+	return requests, nil
+}
+
+func (c *Controller) reconcileNodeRetry(ctx context.Context, nodeName string) (controllerruntime.Result, error) {
+	requests, err := c.requestsForNode(ctx, nodeName)
+	if err != nil {
+		return controllerruntime.Result{}, fmt.Errorf("failed to retry node %s: %w", nodeName, err)
+	}
+	var failures []error
+	requeue := false
+	for _, request := range requests {
+		result, err := c.Reconcile(ctx, request)
+		if err != nil {
+			failures = append(failures, err)
+		}
+		requeue = requeue || result.Requeue || result.RequeueAfter > 0
+	}
+	return controllerruntime.Result{Requeue: requeue}, errors.Join(failures...)
 }
 
 func isEdgeNodeObject(object client.Object) bool {
@@ -407,24 +503,12 @@ func (c *Controller) SetupWithManager(ctx context.Context, mgr controllerruntime
 		For(&policyv1alpha1.ServiceAccountAccess{}).
 		Watches(&reliablesyncsv1alpha1.ObjectSync{}, handler.EnqueueRequestsFromMapFunc(c.mapObjectSyncFunc), builder.WithPredicates(objectSyncDeletePredicate())).
 		Watches(&corev1.Node{}, handler.EnqueueRequestsFromMapFunc(c.mapNodeFunc), builder.WithPredicates(edgeNodeCreatePredicate())).
-		Watches(&rbacv1.ClusterRoleBinding{}, handler.EnqueueRequestsFromMapFunc(c.mapRolesFunc), builder.WithPredicates(predicate.NewPredicateFuncs(func(object client.Object) bool {
-			return c.filterResource(ctx, object)
-		}))).
-		Watches(&rbacv1.RoleBinding{}, handler.EnqueueRequestsFromMapFunc(c.mapRolesFunc), builder.WithPredicates(predicate.NewPredicateFuncs(func(object client.Object) bool {
-			return c.filterResource(ctx, object)
-		}))).
-		Watches(&rbacv1.ClusterRole{}, handler.EnqueueRequestsFromMapFunc(c.mapRolesFunc), builder.WithPredicates(predicate.NewPredicateFuncs(func(object client.Object) bool {
-			return c.filterResource(ctx, object)
-		}))).
-		Watches(&rbacv1.Role{}, handler.EnqueueRequestsFromMapFunc(c.mapRolesFunc), builder.WithPredicates(predicate.NewPredicateFuncs(func(object client.Object) bool {
-			return c.filterResource(ctx, object)
-		}))).
-		Watches(&corev1.ServiceAccount{}, handler.EnqueueRequestsFromMapFunc(c.mapObjectFunc), builder.WithPredicates(predicate.NewPredicateFuncs(func(object client.Object) bool {
-			return c.filterObject(ctx, object)
-		}))).
-		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(c.mapObjectFunc), builder.WithPredicates(predicate.NewPredicateFuncs(func(object client.Object) bool {
-			return c.filterObject(ctx, object)
-		}))).
+		Watches(&rbacv1.ClusterRoleBinding{}, handler.EnqueueRequestsFromMapFunc(mapRBACEvent)).
+		Watches(&rbacv1.RoleBinding{}, handler.EnqueueRequestsFromMapFunc(mapRBACEvent)).
+		Watches(&rbacv1.ClusterRole{}, handler.EnqueueRequestsFromMapFunc(mapRBACEvent)).
+		Watches(&rbacv1.Role{}, handler.EnqueueRequestsFromMapFunc(mapRBACEvent)).
+		Watches(&corev1.ServiceAccount{}, handler.EnqueueRequestsFromMapFunc(mapServiceAccountEvent)).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPodEvent), builder.WithPredicates(podEventPredicate())).
 		Complete(c)
 }
 
@@ -454,6 +538,9 @@ func getNodeListOfServiceAccountAccess(ctx context.Context, reader client.Reader
 	}
 
 	var nodeMap = make(map[string]bool)
+	// Reuse one API snapshot for this reconciliation. Listing all edge nodes for
+	// every Pod's node makes this path quadratic in the fleet size.
+	var edgeNodes map[string]struct{}
 	for _, pod := range podList.Items {
 		if pod.Spec.NodeName == "" {
 			continue
@@ -461,7 +548,20 @@ func getNodeListOfServiceAccountAccess(ctx context.Context, reader client.Reader
 		if nodeMap[pod.Spec.NodeName] {
 			continue
 		}
-		if !isEdgeNode(ctx, reader, pod.Spec.NodeName) {
+		if edgeNodes == nil {
+			edgeNodeList := &corev1.NodeList{}
+			selector := labels.SelectorFromSet(labels.Set{
+				commonconstants.EdgeNodeRoleKey: commonconstants.EdgeNodeRoleValue,
+			})
+			if err := reader.List(ctx, edgeNodeList, &client.ListOptions{LabelSelector: selector}); err != nil {
+				return nil, fmt.Errorf("failed to list edge nodes for serviceaccountaccess %s/%s: %w", acc.Namespace, acc.Name, err)
+			}
+			edgeNodes = make(map[string]struct{}, len(edgeNodeList.Items))
+			for i := range edgeNodeList.Items {
+				edgeNodes[edgeNodeList.Items[i].Name] = struct{}{}
+			}
+		}
+		if _, exists := edgeNodes[pod.Spec.NodeName]; !exists {
 			continue
 		}
 		nodeMap[pod.Spec.NodeName] = true
@@ -588,7 +688,9 @@ func (c *Controller) syncRules(ctx context.Context, acc *policyv1alpha1.ServiceA
 	}
 	userInfo := serviceaccount.UserInfo(newSA.Namespace, newSA.Name, string(newSA.UID))
 	var currentAcc = &policyv1alpha1.ServiceAccountAccess{}
-	c.VisitRulesFor(ctx, userInfo, acc.Namespace, currentAcc)
+	if err := c.VisitRulesFor(ctx, userInfo, acc.Namespace, currentAcc); err != nil {
+		return controllerruntime.Result{}, fmt.Errorf("failed to resolve authorization rules for %s/%s: %w", acc.Namespace, acc.Name, err)
+	}
 	nodes, err := getNodeListOfServiceAccountAccess(ctx, c.Reader, acc)
 	if err != nil {
 		klog.Errorf("failed to get node list of serviceaccountaccess %s/%s, %v", acc.Namespace, acc.Name, err)
@@ -803,11 +905,10 @@ func (c *Controller) GetRoleReferenceRules(ctx context.Context, roleRef rbacv1.R
 	}
 }
 
-func (c *Controller) VisitRulesFor(ctx context.Context, user user.Info, namespace string, acc *policyv1alpha1.ServiceAccountAccess) {
+func (c *Controller) VisitRulesFor(ctx context.Context, user user.Info, namespace string, acc *policyv1alpha1.ServiceAccountAccess) error {
 	crbl := &rbacv1.ClusterRoleBindingList{}
 	if err := c.Reader.List(ctx, crbl); err != nil {
-		klog.Errorf("failed to list clusterrolebindings, %v", err)
-		return
+		return fmt.Errorf("failed to list clusterrolebindings: %w", err)
 	}
 	for _, crb := range crbl.Items {
 		_, applies := appliesTo(user, crb.Subjects, "")
@@ -815,9 +916,11 @@ func (c *Controller) VisitRulesFor(ctx context.Context, user user.Info, namespac
 			continue
 		}
 		rules, err := c.GetRoleReferenceRules(ctx, crb.RoleRef, "")
+		if apierrors.IsNotFound(err) {
+			continue // A deleted role grants no permissions, even if the binding remains.
+		}
 		if err != nil {
-			klog.Errorf("failed to get rules for clusterrolebinding %s, %v", crb.Name, err)
-			return
+			return fmt.Errorf("failed to get rules for clusterrolebinding %s: %w", crb.Name, err)
 		}
 		var accessClusterRoleBinding = policyv1alpha1.AccessClusterRoleBinding{
 			ClusterRoleBinding: crb,
@@ -829,8 +932,7 @@ func (c *Controller) VisitRulesFor(ctx context.Context, user user.Info, namespac
 	if len(namespace) > 0 {
 		var roleBindingList = &rbacv1.RoleBindingList{}
 		if err := c.Reader.List(ctx, roleBindingList, &client.ListOptions{Namespace: namespace}); err != nil {
-			klog.Errorf("failed to list rolebindings, %v", err)
-			return
+			return fmt.Errorf("failed to list rolebindings in namespace %s: %w", namespace, err)
 		}
 		for _, roleBinding := range roleBindingList.Items {
 			_, applies := appliesTo(user, roleBinding.Subjects, namespace)
@@ -838,9 +940,11 @@ func (c *Controller) VisitRulesFor(ctx context.Context, user user.Info, namespac
 				continue
 			}
 			rules, err := c.GetRoleReferenceRules(ctx, roleBinding.RoleRef, namespace)
+			if apierrors.IsNotFound(err) {
+				continue
+			}
 			if err != nil {
-				klog.Errorf("failed to get rules for rolebinding %s, %v", roleBinding.Name, err)
-				return
+				return fmt.Errorf("failed to get rules for rolebinding %s/%s: %w", namespace, roleBinding.Name, err)
 			}
 			var accessRoleBinding = policyv1alpha1.AccessRoleBinding{
 				RoleBinding: roleBinding,
@@ -849,4 +953,5 @@ func (c *Controller) VisitRulesFor(ctx context.Context, user user.Info, namespac
 			acc.Spec.AccessRoleBinding = append(acc.Spec.AccessRoleBinding, accessRoleBinding)
 		}
 	}
+	return nil
 }

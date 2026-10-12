@@ -103,14 +103,14 @@ func (uc *UpstreamController) dispatchMessage() {
 			continue
 		}
 
-		klog.Infof("Dispatch message: %s", msg.GetID())
+		klog.V(4).Infof("Dispatch message: %s", msg.GetID())
 
 		resourceType, err := messagelayer.GetResourceTypeForDevice(msg.GetResource())
 		if err != nil {
 			klog.Warningf("Parse message: %s resource type with error: %s", msg.GetID(), err)
 			continue
 		}
-		klog.Infof("Message: %s, resource type is: %s", msg.GetID(), resourceType)
+		klog.V(4).Infof("Message: %s, resource type is: %s", msg.GetID(), resourceType)
 
 		switch resourceType {
 		case constants.ResourceTypeTwinEdgeUpdated:
@@ -131,7 +131,7 @@ func (uc *UpstreamController) updateDeviceStatus() {
 			klog.Info("Stop updateDeviceStatus")
 			return
 		case msg := <-uc.deviceStatesChan:
-			klog.Infof("Message: %s, operation is: %s, and resource is: %s", msg.GetID(), msg.GetOperation(), msg.GetResource())
+			klog.V(4).Infof("Message: %s, operation is: %s, and resource is: %s", msg.GetID(), msg.GetOperation(), msg.GetResource())
 			msgState, err := uc.unmarshalDeviceStatesMessage(msg)
 			if err != nil {
 				klog.Warningf("Unmarshall failed due to error %v", err)
@@ -203,9 +203,9 @@ func (uc *UpstreamController) updateDeviceStatus() {
 				klog.Warningf("Message: %s process failure, response failed with error: %s", msg.GetID(), err)
 				continue
 			}
-			klog.Infof("Message: %s process successfully", msg.GetID())
+			klog.V(4).Infof("Message: %s process successfully", msg.GetID())
 		case msg := <-uc.deviceTwinsChan:
-			klog.Infof("Message: %s, operation is: %s, and resource is: %s", msg.GetID(), msg.GetOperation(), msg.GetResource())
+			klog.V(4).Infof("Message: %s, operation is: %s, and resource is: %s", msg.GetID(), msg.GetOperation(), msg.GetResource())
 			msgTwin, err := uc.unmarshalDeviceStatusMessage(msg)
 			if err != nil {
 				klog.Warningf("Unmarshall failed due to error %v", err)
@@ -305,7 +305,7 @@ func (uc *UpstreamController) updateDeviceStatus() {
 				klog.Warningf("Message: %s process failure, response failed with error: %s", msg.GetID(), err)
 				continue
 			}
-			klog.Infof("Message: %s process successfully", msg.GetID())
+			klog.V(4).Infof("Message: %s process successfully", msg.GetID())
 		}
 	}
 }

@@ -63,10 +63,8 @@ func TestNodeSessionKeepAliveCheck(t *testing.T) {
 			wg := sync.WaitGroup{}
 			stopCh := make(chan struct{})
 
-			session, mockController, mockConn := openNodeSession(t, &wg, stopCh, tt.SendKeepaliveInterval, client)
+			session, mockController, _ := openNodeSession(t, &wg, stopCh, tt.SendKeepaliveInterval, client)
 			defer mockController.Finish()
-
-			mockConn.EXPECT().Close().AnyTimes()
 
 			if tt.SimulateNormal {
 				after := time.After(5 * time.Second)
@@ -138,8 +136,6 @@ func TestNodeSessionSendNoAckMessage(t *testing.T) {
 			} else {
 				mockConn.EXPECT().WriteMessageAsync(gomock.Any()).Return(errors.New("write err")).Times(1)
 			}
-
-			mockConn.EXPECT().Close().Return(nil).AnyTimes()
 
 			go func() {
 				for _, message := range tt.InitialMessages {
@@ -302,8 +298,6 @@ func TestNodeSessionSendAckMessage(t *testing.T) {
 		defer mockController.Finish()
 
 		// set mock expected
-		mockConn.EXPECT().Close().AnyTimes()
-
 		if test.InjectedConnErrTimes > 0 {
 			mockConn.EXPECT().WriteMessageAsync(gomock.Any()).
 				Return(errors.New("write err")).Times(test.InjectedConnErrTimes)
@@ -410,6 +404,9 @@ func openNodeSession(t *testing.T, wg *sync.WaitGroup, stopCh chan struct{}, sen
 
 	mockController := gomock.NewController(t)
 	mockConn := mockcon.NewMockConnection(mockController)
+	// KeepAliveCheck may close the connection as soon as Start runs. Finish
+	// configuring this expectation before launching any session goroutine.
+	mockConn.EXPECT().Close().AnyTimes()
 
 	session := NewNodeSession(tf.TestNodeID, tf.TestProjectID, mockConn, tf.KeepaliveInterval, nmp, reliableClient)
 

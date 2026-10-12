@@ -58,7 +58,7 @@ func NewController(cli client.Client) *Controller {
 // The Controller will requeue the Request to be processed again if an error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (c *Controller) Reconcile(ctx context.Context, req controllerruntime.Request) (controllerruntime.Result, error) {
-	klog.Infof("Reconciling nodeGroup %s", req.NamespacedName.Name)
+	klog.V(4).Infof("Reconciling nodeGroup %s", req.NamespacedName.Name)
 
 	nodeGroup := &appsv1alpha1.NodeGroup{}
 	if err := c.Client.Get(ctx, req.NamespacedName, nodeGroup); err != nil {

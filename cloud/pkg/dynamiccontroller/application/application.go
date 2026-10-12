@@ -61,7 +61,9 @@ func (c *Center) Process(msg model.Message) {
 		return
 	}
 
-	klog.Infof("[metaserver/ApplicationCenter] get a Application %v", app.String())
+	if klog.V(4).Enabled() {
+		klog.V(4).Infof("[metaserver/ApplicationCenter] get a Application %v", app.String())
+	}
 
 	if config.Config.EnableAuthorization {
 		nodeID, err := messagelayer.GetNodeID(msg)
@@ -89,7 +91,7 @@ func (c *Center) Process(msg model.Message) {
 		return
 	}
 	c.Response(app, msg.GetID(), metaserver.Approved, nil, resp)
-	klog.Infof("[metaserver/applicationCenter]successfully to process Application(%+v)", app)
+	klog.V(4).Infof("[metaserver/applicationCenter]successfully to process Application(%+v)", app)
 }
 
 // ProcessApplication processes application by re-translating it to kube-api request with kube client,
