@@ -237,7 +237,9 @@ func addDevice(context *dtcontext.DTContext, toAdd []dttype.Device, baseMessage 
 		if err != nil {
 			klog.Errorf("Add device %s failed due to some error ,err: %#v", device.ID, err)
 			context.DeviceList.Delete(device.ID)
-			context.Unlock(device.ID)
+			if delta {
+				context.Unlock(device.ID)
+			}
 			continue
 			//todo
 		}
